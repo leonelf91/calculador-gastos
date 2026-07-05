@@ -37,34 +37,10 @@ public class Main {
     record Categoria(String nombre, BigDecimal total, int operaciones) {}
 
     // Reglas de categorización: primera coincidencia gana (sobre la descripción
-    // normalizada en mayúsculas y sin acentos).
-    private static final Map<String, List<String>> REGLAS = new LinkedHashMap<>();
-    static {
-        REGLAS.put("Educación", List.of("INSTITUTO", "COLEGIO", "UNIVERSIDAD"));
-        REGLAS.put("Salud", List.of("OSDE", "FARMACIA", "FARMACITY", "SWISS MEDICAL"));
-        REGLAS.put("Impuestos", List.of("AFIP", "ARCA", "MONOTRIB"));
-        REGLAS.put("Seguros", List.of("FEDERACION PAT", "SEGURO", "LA CAJA"));
-        REGLAS.put("Servicios", List.of("EDENOR", "EDESUR", "TELECENTRO", "PERSONAL", "MOVISTAR",
-                "CLARO", "AYSA", "METROGAS", "NATURGY", "FIBERTEL", "CABLEVISION"));
-        REGLAS.put("Gastronomía", List.of("BONAFIDE", "MC D", "MCD", "MCDONALD", "BURGER",
-                "BODEGON", "ENTREPALITOS", "RESTAURAN", "PARRILLA", "CAFE", "GRIDO",
-                "HELADER", "PIZZ", "STARBUCKS", "MOSTAZA"));
-        REGLAS.put("Supermercado y almacén", List.of("JUMBO", "CENCOSUD", "CARREFOUR", "COTO",
-                "CASADELPOL", "FIAMBRERIA", "PEDIDOSYA", "AMANDA", "EMPORIO", "FAN DE PAN",
-                "REPOST", "PANADERIA", "VERDULERIA", "CARNICERIA", "CHANGOMAS", "VEA",
-                "DISCO SA"));
-        REGLAS.put("Indumentaria y calzado", List.of("GRIMOLDI", "MOOV", "GRISINO", "MACOWENS",
-                "MAVERICK", "DEXTER", "ZARA", "LEVIS", "CHEEKY", "MIMO"));
-        REGLAS.put("Entretenimiento", List.of("SPOTIFY", "NETFLIX", "PARAMOUN", "DISNEY", "HBO",
-                "MAX.COM", "JUGUETES", "PANINI", "CINEMARK", "HOYTS", "STEAM", "PLAYSTATION",
-                "SEVEN MARKET"));
-        REGLAS.put("Mascotas", List.of("NUTRICAN", "PUPPIS", "VETERINAR", "PET"));
-        REGLAS.put("Estacionamiento y transporte", List.of("ESTACIONAMIENTO", "YPF", "SHELL",
-                "AXION", "PEAJE", "SUBE", "UBER", "CABIFY", "KOMO"));
-        REGLAS.put("Hogar y tecnología", List.of("HIDROLIT", "TECNOTEAM", "VIDECOM", "EASY",
-                "SODIMAC", "FRAVEGA", "GARBARINO", "FERRETERIA"));
-        REGLAS.put("Compras online", List.of("MERCADOLIBRE", "MELI", "TIENDAMIA", "AMAZON"));
-    }
+    // normalizada en mayúsculas y sin acentos). Se cargan desde ARCHIVO_REGLAS,
+    // editable sin tocar el código; el orden del archivo define la prioridad.
+    private static final Path ARCHIVO_REGLAS = Path.of("categorias.txt");
+    private static final Map<String, List<String>> reglas = new LinkedHashMap<>();
     private static final String OTROS = "Otros";
     private static final int MAX_PORCIONES_TORTA = 8;
 
@@ -80,6 +56,13 @@ public class Main {
     public static void main(String[] args) throws Exception {
         Path entrada = Path.of(args.length > 0 ? args[0] : "pdfs");
         Path dirSalida = Path.of(args.length > 1 ? args[1] : "htmls");
+
+        try {
+            cargarReglas(ARCHIVO_REGLAS);
+        } catch (IllegalStateException e) {
+            System.err.println(e.getMessage());
+            System.exit(1);
+        }
 
         List<File> pdfs;
         if (Files.isDirectory(entrada)) {
@@ -168,9 +151,50 @@ public class Main {
         return resultado;
     }
 
+    /**
+     * Carga las reglas de categorización desde un archivo de texto con formato
+     * "Categoría = palabra clave, palabra clave, ...". Las líneas vacías o que
+     * empiezan con # se ignoran; si una categoría aparece en más de una línea,
+     * sus palabras clave se acumulan.
+     */
+    static void cargarReglas(Path archivo) {
+        if (!Files.isRegularFile(archivo)) {
+            throw new IllegalStateException("No se encuentra el archivo de reglas: "
+                    + archivo.toAbsolutePath());
+        }
+        List<String> lineas;
+        try {
+            lineas = Files.readAllLines(archivo, StandardCharsets.UTF_8);
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("No se pudo leer " + archivo + ": " + e.getMessage());
+        }
+        reglas.clear();
+        for (String linea : lineas) {
+            String limpia = linea.strip();
+            if (limpia.isEmpty() || limpia.startsWith("#")) continue;
+            int igual = limpia.indexOf('=');
+            if (igual < 1) {
+                System.err.println("Regla ignorada (falta '='): " + limpia);
+                continue;
+            }
+            String categoria = limpia.substring(0, igual).strip();
+            List<String> claves = java.util.Arrays.stream(limpia.substring(igual + 1).split(","))
+                    .map(String::strip).filter(s -> !s.isEmpty()).map(Main::normalizar).toList();
+            if (categoria.isEmpty() || claves.isEmpty()) {
+                System.err.println("Regla ignorada (categoría o palabras clave vacías): " + limpia);
+                continue;
+            }
+            reglas.computeIfAbsent(categoria, k -> new ArrayList<>()).addAll(claves);
+        }
+        if (reglas.isEmpty()) {
+            throw new IllegalStateException("El archivo de reglas no tiene ninguna regla válida: "
+                    + archivo.toAbsolutePath());
+        }
+    }
+
     static String categorizar(String descripcion) {
         String desc = normalizar(descripcion);
-        for (Map.Entry<String, List<String>> regla : REGLAS.entrySet()) {
+        for (Map.Entry<String, List<String>> regla : reglas.entrySet()) {
             if (regla.getValue().stream().anyMatch(desc::contains)) return regla.getKey();
         }
         return OTROS;

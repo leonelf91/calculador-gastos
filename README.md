@@ -44,20 +44,27 @@ java -cp "out;lib\pdfbox-app-3.0.5.jar" Main [pdf-o-directorio] [directorio-sali
 ## Estructura
 
 ```
-├── pdfs/          resúmenes de tarjeta (ignorado por git)
-├── htmls/         reportes generados (ignorado por git)
-├── src/Main.java  todo el proceso: parseo, categorización y generación del HTML
-├── lib/           PDFBox standalone
-└── procesar.bat   compila y ejecuta
+├── pdfs/           resúmenes de tarjeta (ignorado por git)
+├── htmls/          reportes generados (ignorado por git)
+├── src/Main.java   todo el proceso: parseo, categorización y generación del HTML
+├── categorias.txt  reglas de categorización (editable sin tocar código)
+├── lib/            PDFBox standalone
+└── procesar.bat    compila y ejecuta
 ```
 
 ## Categorización
 
-Las reglas están en el mapa `REGLAS` de `src/Main.java`: cada categoría tiene
-una lista de palabras clave que se buscan en la descripción del consumo
-(la primera coincidencia gana). Los comercios que no matchean ninguna regla
-caen en "Otros". Para ajustar una categoría, editá la lista de palabras clave
-y volvé a correr `procesar.bat`.
+Las reglas viven en **`categorias.txt`**, una por línea con el formato:
+
+```
+Categoría = palabra clave, palabra clave, ...
+```
+
+Cada palabra clave se busca dentro de la descripción del consumo, sin
+distinguir mayúsculas ni acentos. La primera coincidencia gana (las categorías
+se evalúan en el orden del archivo) y los comercios que no matchean ninguna
+regla caen en "Otros". Para ajustar una categoría, editá el archivo y volvé
+a correr `procesar.bat` — no hace falta tocar el código.
 
 Notas:
 

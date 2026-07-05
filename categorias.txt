@@ -1,0 +1,24 @@
+# Reglas de categorización de consumos.
+#
+# Formato:  Categoría = palabra clave, palabra clave, ...
+#
+# - Cada palabra clave se busca dentro de la descripción del consumo,
+#   sin distinguir mayúsculas ni acentos.
+# - La primera coincidencia gana: las categorías se evalúan en el orden
+#   de este archivo.
+# - Los consumos que no coinciden con ninguna regla caen en "Otros".
+# - Las líneas vacías o que empiezan con # se ignoran.
+
+Educación = INSTITUTO, COLEGIO, UNIVERSIDAD
+Salud = OSDE, FARMACIA, FARMACITY, SWISS MEDICAL
+Impuestos = AFIP, ARCA, MONOTRIB
+Seguros = FEDERACION PAT, SEGURO, LA CAJA
+Servicios = EDENOR, EDESUR, TELECENTRO, PERSONAL, MOVISTAR, CLARO, AYSA, METROGAS, NATURGY, FIBERTEL, CABLEVISION
+Gastronomía = BONAFIDE, MC D, MCD, MCDONALD, BURGER, BODEGON, ENTREPALITOS, RESTAURAN, PARRILLA, CAFE, GRIDO, HELADER, PIZZ, STARBUCKS, MOSTAZA
+Supermercado y almacén = JUMBO, CENCOSUD, CARREFOUR, COTO, CASADELPOL, FIAMBRERIA, PEDIDOSYA, AMANDA, EMPORIO, FAN DE PAN, REPOST, PANADERIA, VERDULERIA, CARNICERIA, CHANGOMAS, VEA, DISCO SA
+Indumentaria y calzado = GRIMOLDI, MOOV, GRISINO, MACOWENS, MAVERICK, DEXTER, ZARA, LEVIS, CHEEKY, MIMO
+Entretenimiento = SPOTIFY, NETFLIX, PARAMOUN, DISNEY, HBO, MAX.COM, JUGUETES, PANINI, CINEMARK, HOYTS, STEAM, PLAYSTATION, SEVEN MARKET
+Mascotas = NUTRICAN, PUPPIS, VETERINAR, PET
+Estacionamiento y transporte = ESTACIONAMIENTO, YPF, SHELL, AXION, PEAJE, SUBE, UBER, CABIFY, KOMO
+Hogar y tecnología = HIDROLIT, TECNOTEAM, VIDECOM, EASY, SODIMAC, FRAVEGA, GARBARINO, FERRETERIA
+Compras online = MERCADOLIBRE, MELI, TIENDAMIA, AMAZON
