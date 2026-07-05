@@ -194,18 +194,31 @@ public class Main {
                 .toList();
     }
 
-    /** Colapsa la cola de categorías en "Otros" para que la torta tenga como máximo 8 porciones. */
+    /**
+     * Colapsa la cola de categorías en "Otros" para que la torta tenga como
+     * máximo 8 porciones. La categoría de respaldo "Otros" (comercios sin
+     * regla) se funde con esa porción colapsada, así nunca hay dos porciones
+     * con el mismo nombre, y "Otros" va siempre al final.
+     */
     static List<Categoria> paraTorta(List<Categoria> categorias) {
-        if (categorias.size() <= MAX_PORCIONES_TORTA) return categorias;
-        List<Categoria> torta = new ArrayList<>(categorias.subList(0, MAX_PORCIONES_TORTA - 1));
-        BigDecimal resto = BigDecimal.ZERO;
-        int ops = 0;
-        for (Categoria c : categorias.subList(MAX_PORCIONES_TORTA - 1, categorias.size())) {
+        List<Categoria> conNombre = new ArrayList<>(
+                categorias.stream().filter(c -> !c.nombre().equals(OTROS)).toList());
+        BigDecimal resto = categorias.stream().filter(c -> c.nombre().equals(OTROS))
+                .map(Categoria::total).reduce(BigDecimal.ZERO, BigDecimal::add);
+        int ops = categorias.stream().filter(c -> c.nombre().equals(OTROS))
+                .mapToInt(Categoria::operaciones).sum();
+        boolean hayOtros = categorias.size() > conNombre.size();
+
+        int lugares = hayOtros || conNombre.size() > MAX_PORCIONES_TORTA
+                ? MAX_PORCIONES_TORTA - 1 : MAX_PORCIONES_TORTA;
+        while (conNombre.size() > lugares) {
+            Categoria c = conNombre.remove(conNombre.size() - 1);
             resto = resto.add(c.total());
             ops += c.operaciones();
+            hayOtros = true;
         }
-        torta.add(new Categoria(OTROS, resto, ops));
-        return torta;
+        if (hayOtros) conNombre.add(new Categoria(OTROS, resto, ops));
+        return conNombre;
     }
 
     // ------------------------------------------------------------------ salida
