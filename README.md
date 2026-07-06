@@ -52,6 +52,20 @@ java -cp "out;lib\pdfbox-app-3.0.5.jar" Main [pdf-o-directorio] [directorio-sali
 └── procesar.bat    compila y ejecuta
 ```
 
+## Cotización del dólar (GitHub Pages)
+
+Proceso aparte (`src/CotizacionDolar.java`) que consulta al Banco Nación la
+cotización del dólar billete de los últimos 90 días, genera en
+`docs/index.html` una página con el gráfico diario del valor de venta, un
+monto fijo en pesos y su equivalente en dólares a la venta del día, y la
+publica commiteando `docs/` a `main` (GitHub Pages sirve ese directorio):
+
+```bat
+cotizacion.bat
+```
+
+La página queda en <https://leonelf91.github.io/calculador-gastos/>.
+
 ## Categorización
 
 Las reglas viven en **`categorias.txt`**, una por línea con el formato:
