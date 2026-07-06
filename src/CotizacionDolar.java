@@ -190,8 +190,10 @@ public class CotizacionDolar {
             double y = MARGEN_SUP + plotAlto - (c.venta().doubleValue() - yMin) / (yMax - yMin) * plotAlto;
             puntosLinea.append(i == 0 ? "M" : " L").append(svg("%.1f %.1f", x, y));
             if (i > 0) datosJs.append(",");
-            datosJs.append(svg("{x:%.1f,y:%.1f,f:\"%s\",v:\"%s\"}",
-                    x, y, FECHA_BNA.format(c.fecha()), pesos2().format(c.venta())));
+            BigDecimal usdDia = MONTO_ARS.divide(c.venta(), 2, RoundingMode.HALF_UP);
+            datosJs.append(svg("{x:%.1f,y:%.1f,f:\"%s\",v:\"%s\",u:\"%s\"}",
+                    x, y, FECHA_BNA.format(c.fecha()), pesos2().format(c.venta()),
+                    dolares().format(usdDia)));
         }
 
         double ux = xDe(diaFinal, diaInicial, diaFinal, plotAncho);
@@ -309,6 +311,11 @@ public class CotizacionDolar {
     padding: 8px 11px; border-radius: 8px; font-size: 0.8rem;
   }
   #tooltip strong { display: block; font-variant-numeric: tabular-nums; }
+  #tooltip .usd {
+    display: block; margin-top: 4px; padding-top: 4px; font-size: 0.72rem; opacity: .88;
+    border-top: 1px solid color-mix(in srgb, var(--superficie) 25%, transparent);
+    font-variant-numeric: tabular-nums;
+  }
 </style>
 </head>
 <body>
@@ -366,7 +373,8 @@ __GRILLA____EJE_X__      <path class="serie" d="__LINEA__"/>
     puntoHover.setAttribute('cx', cercano.x);
     puntoHover.setAttribute('cy', cercano.y);
     hover.style.display = '';
-    tooltip.innerHTML = cercano.f + '<strong>' + cercano.v + '</strong>';
+    tooltip.innerHTML = cercano.f + '<strong>' + cercano.v + '</strong>'
+        + '<span class="usd">__MONTO_ARS__ = ' + cercano.u + '</span>';
     tooltip.style.display = 'block';
     tooltip.style.left = Math.min(ev.clientX + 14, window.innerWidth - tooltip.offsetWidth - 8) + 'px';
     tooltip.style.top = (ev.clientY - 40) + 'px';
