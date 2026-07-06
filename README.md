@@ -64,7 +64,12 @@ publica commiteando `docs/` a `main` (GitHub Pages sirve ese directorio):
 cotizacion.bat
 ```
 
-La página queda en <https://leonelf91.github.io/calculador-gastos/>.
+La página queda en <https://leonelf91.github.io/calculador-gastos/>, protegida
+con clave: el HTML publicado está cifrado con AES-256-GCM (clave derivada por
+PBKDF2) y se desencripta en el navegador. La clave vive en `clave.txt` (local,
+ignorado por git; si no existe, el proceso genera una aleatoria). Se puede
+entrar con el formulario o directo por URL:
+`https://leonelf91.github.io/calculador-gastos/?clave=<la-clave>`.
 
 ## Categorización
 

@@ -1,3 +1,8 @@
+import javax.crypto.Cipher;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.SecretKeySpec;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
@@ -18,6 +23,7 @@ import java.text.DecimalFormatSymbols;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
@@ -42,6 +48,11 @@ public class CotizacionDolar {
     private static final BigDecimal MONTO_ARS = new BigDecimal("113680000");
 
     private static final Path SALIDA = Path.of("docs", "index.html");
+
+    // La página publicada va cifrada con AES-256-GCM; la clave se deriva con
+    // PBKDF2 de la frase guardada en ARCHIVO_CLAVE (local, ignorado por git).
+    private static final Path ARCHIVO_CLAVE = Path.of("clave.txt");
+    private static final int ITERACIONES_PBKDF2 = 600_000;
 
     private static final DateTimeFormatter FECHA_BNA = DateTimeFormatter.ofPattern("dd/MM/yyyy");
     private static final DateTimeFormatter FECHA_CSV = DateTimeFormatter.ofPattern("d/M/yyyy");
@@ -79,9 +90,57 @@ public class CotizacionDolar {
                 pesos0().format(MONTO_ARS), dolares().format(montoUsd));
 
         String html = generarHtml(cotizaciones, ultima, montoUsd, hasta);
+        String clave = leerOCrearClave();
+        Cifrado cifrado = encriptar(html, clave);
+        String pagina = plantillaLoader()
+                .replace("__SALT__", cifrado.salt())
+                .replace("__IV__", cifrado.iv())
+                .replace("__DATOS__", cifrado.datos())
+                .replace("__ITERACIONES__", String.valueOf(ITERACIONES_PBKDF2));
         Files.createDirectories(SALIDA.getParent());
-        Files.writeString(SALIDA, html, StandardCharsets.UTF_8);
-        System.out.println("Página generada: " + SALIDA.toAbsolutePath());
+        Files.writeString(SALIDA, pagina, StandardCharsets.UTF_8);
+        System.out.println("Página generada (cifrada con la clave de "
+                + ARCHIVO_CLAVE + "): " + SALIDA.toAbsolutePath());
+    }
+
+    // ------------------------------------------------------------------
+    // Cifrado de la página
+    // ------------------------------------------------------------------
+
+    record Cifrado(String salt, String iv, String datos) {}
+
+    private static String leerOCrearClave() throws Exception {
+        if (Files.exists(ARCHIVO_CLAVE)) {
+            String clave = Files.readString(ARCHIVO_CLAVE, StandardCharsets.UTF_8).trim();
+            if (!clave.isEmpty()) return clave;
+        }
+        byte[] azar = new byte[12];
+        new SecureRandom().nextBytes(azar);
+        String clave = Base64.getUrlEncoder().withoutPadding().encodeToString(azar);
+        Files.writeString(ARCHIVO_CLAVE, clave + System.lineSeparator(), StandardCharsets.UTF_8);
+        System.out.println("Se generó una clave nueva en " + ARCHIVO_CLAVE.toAbsolutePath()
+                + " (editable; no se versiona)");
+        return clave;
+    }
+
+    private static Cifrado encriptar(String html, String clave) throws Exception {
+        SecureRandom azar = new SecureRandom();
+        byte[] salt = new byte[16];
+        byte[] iv = new byte[12];
+        azar.nextBytes(salt);
+        azar.nextBytes(iv);
+
+        SecretKeyFactory fabrica = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+        byte[] llave = fabrica.generateSecret(
+                new PBEKeySpec(clave.toCharArray(), salt, ITERACIONES_PBKDF2, 256)).getEncoded();
+        Cipher cifrador = Cipher.getInstance("AES/GCM/NoPadding");
+        cifrador.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(llave, "AES"),
+                new GCMParameterSpec(128, iv));
+        byte[] datos = cifrador.doFinal(html.getBytes(StandardCharsets.UTF_8));
+
+        Base64.Encoder b64 = Base64.getEncoder();
+        return new Cifrado(b64.encodeToString(salt), b64.encodeToString(iv),
+                b64.encodeToString(datos));
     }
 
     // ------------------------------------------------------------------
@@ -247,6 +306,115 @@ public class CotizacionDolar {
         simbolos.setGroupingSeparator('.');
         simbolos.setDecimalSeparator(',');
         return new DecimalFormat(patron, simbolos);
+    }
+
+    // Página publicada: solo contiene el reporte cifrado y el formulario de
+    // clave; el descifrado (PBKDF2 + AES-GCM) corre en el navegador.
+    static String plantillaLoader() {
+        return """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dólar BNA — acceso</title>
+<style>
+  :root {
+    --superficie: #fcfcfb;
+    --plano: #f9f9f7;
+    --tinta: #0b0b0b;
+    --tinta-secundaria: #52514e;
+    --borde: rgba(11,11,11,0.10);
+    --acento: #2a78d6;
+    --error: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --superficie: #1a1a19;
+      --plano: #0d0d0d;
+      --tinta: #ffffff;
+      --tinta-secundaria: #c3c2b7;
+      --borde: rgba(255,255,255,0.10);
+      --acento: #3987e5;
+      --error: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--plano); color: var(--tinta);
+    min-height: 100vh; display: grid; place-items: center; padding: 24px;
+  }
+  form {
+    background: var(--superficie); border: 1px solid var(--borde);
+    border-radius: 12px; padding: 28px; width: min(380px, 100%);
+    display: grid; gap: 14px;
+  }
+  h1 { font-size: 1.2rem; }
+  p { color: var(--tinta-secundaria); font-size: 0.9rem; }
+  .fila { display: flex; gap: 10px; }
+  input {
+    flex: 1; min-width: 0; padding: 9px 12px; font-size: 1rem;
+    border: 1px solid var(--borde); border-radius: 8px;
+    background: var(--plano); color: var(--tinta);
+  }
+  button {
+    padding: 9px 18px; font-size: 1rem; border: none; border-radius: 8px;
+    background: var(--acento); color: #fff; cursor: pointer;
+  }
+  #error { color: var(--error); }
+  [hidden] { display: none; }
+</style>
+</head>
+<body>
+<form id="form">
+  <h1>Página protegida</h1>
+  <p>Ingresá la clave para ver la cotización del dólar.</p>
+  <div class="fila">
+    <input type="password" id="clave" placeholder="Clave" autofocus autocomplete="current-password">
+    <button>Ver</button>
+  </div>
+  <p id="error" hidden>Clave incorrecta.</p>
+</form>
+<script>
+  const P = {salt: "__SALT__", iv: "__IV__", datos: "__DATOS__", iteraciones: __ITERACIONES__};
+  const aBytes = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+  async function descifrar(clave) {
+    const material = await crypto.subtle.importKey(
+        'raw', new TextEncoder().encode(clave), 'PBKDF2', false, ['deriveKey']);
+    const llave = await crypto.subtle.deriveKey(
+        {name: 'PBKDF2', salt: aBytes(P.salt), iterations: P.iteraciones, hash: 'SHA-256'},
+        material, {name: 'AES-GCM', length: 256}, false, ['decrypt']);
+    const plano = await crypto.subtle.decrypt(
+        {name: 'AES-GCM', iv: aBytes(P.iv)}, llave, aBytes(P.datos));
+    return new TextDecoder().decode(plano);
+  }
+
+  async function intentar(clave, avisarError) {
+    try {
+      const html = await descifrar(clave);
+      document.open();
+      document.write(html);
+      document.close();
+    } catch (e) {
+      if (avisarError) document.getElementById('error').hidden = false;
+    }
+  }
+
+  document.getElementById('form').addEventListener('submit', ev => {
+    ev.preventDefault();
+    intentar(document.getElementById('clave').value, true);
+  });
+  // Acceso directo: la clave puede ir como query param (?clave=...) o en el
+  // fragmento (#clave); el fragmento no se envía al servidor, el query sí.
+  const claveUrl = new URLSearchParams(location.search).get('clave')
+      || (location.hash.length > 1 ? decodeURIComponent(location.hash.slice(1)) : null);
+  if (claveUrl) intentar(claveUrl, false);
+</script>
+</body>
+</html>
+""";
     }
 
     static String plantilla() {

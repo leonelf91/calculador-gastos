@@ -3,6 +3,7 @@ pdfs/*
 !pdfs/.gitkeep
 htmls/*
 !htmls/.gitkeep
+clave.txt
 
 ### Claude Code ###
 .claude/
