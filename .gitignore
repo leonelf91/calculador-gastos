@@ -4,6 +4,7 @@ pdfs/*
 htmls/*
 !htmls/.gitkeep
 clave.txt
+cotizacion.log
 
 ### Claude Code ###
 .claude/
