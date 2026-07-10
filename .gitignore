@@ -3,9 +3,10 @@ pdfs/*
 !pdfs/.gitkeep
 htmls/*
 !htmls/.gitkeep
+mpago/*
+!mpago/.gitkeep
 clave.txt
 cotizacion.log
-mpago/
 
 ### Claude Code ###
 .claude/
