@@ -11,38 +11,51 @@ import java.nio.file.Path;
 import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
 import java.text.Normalizer;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Proceso batch: lee resúmenes de tarjeta de crédito (PDF de BBVA Visa),
- * extrae los consumos, los categoriza por reglas de comercio y genera por
- * cada PDF un reporte HTML con un gráfico de torta (donut) de gastos por
- * categoría.
+ * Proceso batch: lee resúmenes de tarjeta de crédito (PDF de BBVA Visa) y
+ * movimientos de Mercado Pago (CSV en mpago/), extrae los consumos, los
+ * categoriza por reglas de comercio y genera un único reporte HTML con un
+ * selector de período (un período por resumen), un selector de fuente
+ * (Visa / Mercado Pago / ambas) y un gráfico de torta (donut) de gastos
+ * por categoría.
  *
  * Uso: java Main [pdf-o-directorio] [directorio-salida]
  *   - Sin argumentos procesa todos los PDFs de "pdfs/" y escribe en "htmls/".
- *   - Con un PDF puntual, genera su HTML en el directorio de salida.
+ *   - Con un PDF puntual, genera el reporte solo con ese período.
  */
 public class Main {
 
-    record Movimiento(String fecha, String descripcion, String cupon, BigDecimal importe,
-                      boolean enDolares, String categoria) {}
+    record Movimiento(String fecha, LocalDate dia, String descripcion, String cupon,
+                      BigDecimal importe, boolean enDolares, String categoria, String fuente) {}
 
     record Categoria(String nombre, BigDecimal total, int operaciones) {}
+
+    record Periodo(LocalDate desde, LocalDate hasta, String etiqueta) {}
+
+    record Resumen(String id, Periodo periodo, List<Movimiento> visa, List<Movimiento> mpago) {}
 
     // Reglas de categorización: primera coincidencia gana (sobre la descripción
     // normalizada en mayúsculas y sin acentos). Se cargan desde ARCHIVO_REGLAS,
     // editable sin tocar el código; el orden del archivo define la prioridad.
     private static final Path ARCHIVO_REGLAS = Path.of("categorias.txt");
+    private static final Path DIRECTORIO_MPAGO = Path.of("mpago");
     private static final Map<String, List<String>> reglas = new LinkedHashMap<>();
     private static final String OTROS = "Otros";
     private static final int MAX_PORCIONES_TORTA = 8;
+
+    private static final String FUENTE_VISA = "Visa";
+    private static final String FUENTE_MPAGO = "Mercado Pago";
 
     // Paleta categórica validada (dataviz): orden fijo, modo claro / oscuro.
     private static final String[] PALETA_CLARA = {"#2a78d6", "#1baf7a", "#eda100", "#008300",
@@ -52,6 +65,20 @@ public class Main {
 
     private static final Pattern LINEA_CONSUMO = Pattern.compile(
             "^(\\d{2}-[A-Za-z]{3}-\\d{2})\\s+(.+?)\\s+(\\d{6})\\s+(-?\\d{1,3}(?:\\.\\d{3})*,\\d{2})$");
+
+    private static final Pattern CIERRE_ANTERIOR = Pattern.compile(
+            "CIERRE ANTERIOR\\s+(\\d{2}-[A-Za-z]{3}-\\d{2})");
+    private static final Pattern CIERRE_ACTUAL = Pattern.compile(
+            "CIERRE ACTUAL\\s+(\\d{2}-[A-Za-z]{3}-\\d{2})");
+
+    private static final Pattern FECHA_VISA = Pattern.compile("(\\d{2})-([A-Za-z]{3})-(\\d{2})");
+    private static final Pattern FECHA_MPAGO = Pattern.compile("(\\d{2})-(\\d{2})-(\\d{4})");
+
+    private static final Map<String, Integer> MESES = Map.ofEntries(
+            Map.entry("ENE", 1), Map.entry("FEB", 2), Map.entry("MAR", 3), Map.entry("ABR", 4),
+            Map.entry("MAY", 5), Map.entry("JUN", 6), Map.entry("JUL", 7), Map.entry("AGO", 8),
+            Map.entry("SEP", 9), Map.entry("SET", 9), Map.entry("OCT", 10), Map.entry("NOV", 11),
+            Map.entry("DIC", 12));
 
     public static void main(String[] args) throws Exception {
         Path entrada = Path.of(args.length > 0 ? args[0] : "pdfs");
@@ -63,6 +90,8 @@ public class Main {
             System.err.println(e.getMessage());
             System.exit(1);
         }
+
+        List<Movimiento> mpagoTodos = cargarMovimientosMpago(DIRECTORIO_MPAGO);
 
         List<File> pdfs;
         if (Files.isDirectory(entrada)) {
@@ -84,42 +113,66 @@ public class Main {
 
         Files.createDirectories(dirSalida);
         int fallidos = 0;
+        List<Resumen> resumenes = new ArrayList<>();
         for (File pdf : pdfs) {
             try {
-                procesar(pdf, dirSalida);
+                resumenes.add(parsearResumen(pdf, mpagoTodos));
             } catch (Exception e) {
                 fallidos++;
                 System.err.println("Error procesando " + pdf.getName() + ": " + e.getMessage());
             }
         }
-        System.out.printf("%nProcesados %d de %d PDFs -> %s%n",
-                pdfs.size() - fallidos, pdfs.size(), dirSalida.toAbsolutePath());
+        if (resumenes.isEmpty()) {
+            System.err.println("No se pudo procesar ningún PDF");
+            System.exit(2);
+        }
+        resumenes.sort(Comparator.comparing(
+                (Resumen r) -> r.periodo() == null ? null : r.periodo().hasta(),
+                Comparator.nullsFirst(Comparator.naturalOrder())));
+
+        Path salida = dirSalida.resolve("gastos.html");
+        Files.writeString(salida, generarHtml(resumenes), StandardCharsets.UTF_8);
+
+        System.out.printf("%nProcesados %d de %d PDFs%n", pdfs.size() - fallidos, pdfs.size());
+        System.out.println("Reporte generado: " + salida.toAbsolutePath());
         if (fallidos > 0) System.exit(2);
     }
 
-    static void procesar(File pdf, Path dirSalida) throws Exception {
+    static Resumen parsearResumen(File pdf, List<Movimiento> mpagoTodos) throws Exception {
         String base = pdf.getName().replaceFirst("(?i)\\.pdf$", "");
-        Path salida = dirSalida.resolve("gastos-" + base + ".html");
 
         String texto;
         try (PDDocument doc = Loader.loadPDF(pdf)) {
             texto = new PDFTextStripper().getText(doc);
         }
 
-        List<Movimiento> movimientos = parsearConsumos(texto);
-        if (movimientos.isEmpty()) {
+        List<Movimiento> visa = parsearConsumos(texto);
+        if (visa.isEmpty()) {
             throw new IllegalStateException("no se encontraron consumos (¿es un resumen de tarjeta BBVA?)");
         }
 
-        List<Categoria> categorias = agrupar(movimientos.stream().filter(m -> !m.enDolares()).toList());
-        List<Movimiento> enDolares = movimientos.stream().filter(Movimiento::enDolares).toList();
-
-        String html = generarHtml(base, movimientos, categorias, enDolares);
-        Files.writeString(salida, html, StandardCharsets.UTF_8);
+        Periodo periodo = parsearPeriodo(texto);
+        List<Movimiento> mpago = filtrarPorPeriodo(mpagoTodos, periodo);
 
         System.out.println();
         System.out.println("=== " + pdf.getName() + " ===");
-        imprimirResumen(categorias, enDolares, salida);
+        if (periodo != null) {
+            System.out.printf("Período: %s — Visa %d ops, Mercado Pago %d ops%n",
+                    periodo.etiqueta(), visa.size(), mpago.size());
+        }
+        List<Movimiento> ambas = combinar(visa, mpago);
+        imprimirResumen(agrupar(ambas.stream().filter(m -> !m.enDolares()).toList()),
+                ambas.stream().filter(Movimiento::enDolares).toList());
+
+        return new Resumen(base, periodo, visa, mpago);
+    }
+
+    static List<Movimiento> combinar(List<Movimiento> visa, List<Movimiento> mpago) {
+        List<Movimiento> ambas = new ArrayList<>(visa);
+        ambas.addAll(mpago);
+        ambas.sort(Comparator.comparing(Movimiento::dia,
+                Comparator.nullsLast(Comparator.naturalOrder())));
+        return ambas;
     }
 
     // ------------------------------------------------------------------ parseo
@@ -145,10 +198,93 @@ public class Main {
             String descripcion = m.group(2).strip();
             boolean usd = normalizar(descripcion).contains("USD");
             BigDecimal importe = new BigDecimal(m.group(4).replace(".", "").replace(',', '.'));
-            resultado.add(new Movimiento(m.group(1), descripcion, m.group(3), importe, usd,
-                    categorizar(descripcion)));
+            resultado.add(new Movimiento(m.group(1), parsearFechaVisa(m.group(1)), descripcion,
+                    m.group(3), importe, usd, categorizar(descripcion), FUENTE_VISA));
         }
         return resultado;
+    }
+
+    static Periodo parsearPeriodo(String texto) {
+        Matcher desde = CIERRE_ANTERIOR.matcher(texto);
+        Matcher hasta = CIERRE_ACTUAL.matcher(texto);
+        if (!desde.find() || !hasta.find()) return null;
+        return new Periodo(parsearFechaVisa(desde.group(1)), parsearFechaVisa(hasta.group(1)),
+                desde.group(1) + " al " + hasta.group(1));
+    }
+
+    static LocalDate parsearFechaVisa(String fecha) {
+        Matcher m = FECHA_VISA.matcher(fecha);
+        if (!m.matches()) return null;
+        Integer mes = MESES.get(normalizar(m.group(2)));
+        if (mes == null) return null;
+        return LocalDate.of(2000 + Integer.parseInt(m.group(3)), mes, Integer.parseInt(m.group(1)));
+    }
+
+    static LocalDate parsearFechaMpago(String fecha) {
+        Matcher m = FECHA_MPAGO.matcher(fecha);
+        if (!m.matches()) return null;
+        return LocalDate.of(Integer.parseInt(m.group(3)), Integer.parseInt(m.group(2)),
+                Integer.parseInt(m.group(1)));
+    }
+
+    /**
+     * Lee todos los CSV de movimientos de Mercado Pago del directorio dado.
+     * Solo toma los movimientos con monto negativo (gastos, guardados con el
+     * importe en positivo), excluye transferencias propias (Leonel Fernandez /
+     * Melina Taboada) y deduplica por REFERENCE_ID por si los archivos se
+     * superponen.
+     */
+    static List<Movimiento> cargarMovimientosMpago(Path dir) {
+        if (!Files.isDirectory(dir)) return List.of();
+        List<Path> csvs;
+        try (var stream = Files.list(dir)) {
+            csvs = stream.filter(p -> p.toString().toLowerCase().endsWith(".csv")).sorted().toList();
+        } catch (java.io.IOException e) {
+            System.err.println("No se pudo listar " + dir + ": " + e.getMessage());
+            return List.of();
+        }
+        List<Movimiento> resultado = new ArrayList<>();
+        Set<String> referencias = new HashSet<>();
+        for (Path csv : csvs) {
+            try {
+                for (String linea : Files.readAllLines(csv, StandardCharsets.UTF_8)) {
+                    String[] campos = linea.strip().split(";");
+                    if (campos.length < 4 || !FECHA_MPAGO.matcher(campos[0]).matches()) continue;
+                    BigDecimal neto = new BigDecimal(campos[3].replace(".", "").replace(',', '.'));
+                    if (neto.signum() >= 0) continue;
+                    String descripcion = campos[1].strip();
+                    if (esMovimientoPropio(descripcion)) continue;
+                    if (!referencias.add(campos[2])) continue;
+                    resultado.add(new Movimiento(campos[0], parsearFechaMpago(campos[0]), descripcion,
+                            campos[2], neto.negate(), false, categorizar(descripcion), FUENTE_MPAGO));
+                }
+            } catch (Exception e) {
+                System.err.println("Error leyendo " + csv.getFileName() + ": " + e.getMessage());
+            }
+        }
+        return resultado;
+    }
+
+    static boolean esMovimientoPropio(String descripcion) {
+        String d = normalizar(descripcion);
+        return (d.contains("FERNANDEZ") && d.contains("LEONEL"))
+                || (d.contains("TABOADA") && d.contains("MELINA"));
+    }
+
+    /**
+     * Se queda con los movimientos posteriores al cierre anterior y hasta el
+     * cierre actual inclusive, que es el rango que cubre el resumen.
+     */
+    static List<Movimiento> filtrarPorPeriodo(List<Movimiento> movimientos, Periodo periodo) {
+        if (periodo == null || periodo.desde() == null || periodo.hasta() == null) {
+            System.err.println("Aviso: no se pudo determinar el período del resumen; "
+                    + "se incluyen todos los movimientos de Mercado Pago");
+            return movimientos;
+        }
+        return movimientos.stream()
+                .filter(m -> m.dia() != null && m.dia().isAfter(periodo.desde())
+                        && !m.dia().isAfter(periodo.hasta()))
+                .toList();
     }
 
     /**
@@ -247,7 +383,7 @@ public class Main {
 
     // ------------------------------------------------------------------ salida
 
-    static void imprimirResumen(List<Categoria> categorias, List<Movimiento> enDolares, Path salida) {
+    static void imprimirResumen(List<Categoria> categorias, List<Movimiento> enDolares) {
         BigDecimal total = categorias.stream().map(Categoria::total).reduce(BigDecimal.ZERO, BigDecimal::add);
         System.out.println();
         System.out.println("Gastos por categoria (ARS):");
@@ -260,8 +396,6 @@ public class Main {
             BigDecimal totalUsd = enDolares.stream().map(Movimiento::importe).reduce(BigDecimal.ZERO, BigDecimal::add);
             System.out.printf("  Consumos en dolares: USD %s (%d ops)%n", formatoMonto(totalUsd), enDolares.size());
         }
-        System.out.println();
-        System.out.println("Reporte generado: " + salida.toAbsolutePath());
     }
 
     static double porcentaje(BigDecimal parte, BigDecimal total) {
@@ -282,31 +416,74 @@ public class Main {
 
     // ------------------------------------------------------------------ HTML
 
-    static String generarHtml(String periodo, List<Movimiento> movimientos,
-                              List<Categoria> categorias, List<Movimiento> enDolares) {
-        List<Categoria> torta = paraTorta(categorias);
-        BigDecimal total = categorias.stream().map(Categoria::total).reduce(BigDecimal.ZERO, BigDecimal::add);
+    static String generarHtml(List<Resumen> resumenes) {
+        Resumen inicial = resumenes.get(resumenes.size() - 1);
+        StringBuilder botonesPeriodo = new StringBuilder();
+        StringBuilder vistas = new StringBuilder();
+        for (Resumen r : resumenes) {
+            String etiqueta = r.periodo() == null ? r.id() : r.periodo().etiqueta();
+            botonesPeriodo.append("    <button type=\"button\" data-periodo=\"")
+                    .append(escaparHtml(r.id())).append("\"")
+                    .append(r == inicial ? " class=\"activo\"" : "").append(">")
+                    .append(escaparHtml(etiqueta)).append("</button>\n");
 
-        String svg = generarDonut(torta, total);
-        String leyenda = generarLeyenda(torta, total);
-        String tablaCategorias = generarTablaCategorias(categorias, total);
-        String tablaMovimientos = generarTablaMovimientos(movimientos);
-        String seccionUsd = generarSeccionUsd(enDolares);
-        String variablesColor = generarVariablesColor();
-        String datosOperaciones = generarDatosOperaciones(torta,
-                movimientos.stream().filter(m -> !m.enDolares()).toList());
+            String kpiPeriodo = generarKpiPeriodo(r.periodo() == null ? null : r.periodo().etiqueta());
+            vistas.append(generarVista(r.id(), "visa", false, kpiPeriodo, r.visa()))
+                    .append(generarVista(r.id(), "mpago", false, kpiPeriodo, r.mpago()))
+                    .append(generarVista(r.id(), "ambas", r == inicial, kpiPeriodo,
+                            combinar(r.visa(), r.mpago())));
+        }
 
         return plantilla()
-                .replace("__DATOS_OPS__", datosOperaciones)
-                .replace("__PERIODO__", escaparHtml(periodo))
+                .replace("__COLORES__", generarVariablesColor())
+                .replace("__BOTONES_PERIODO__", botonesPeriodo.toString())
+                .replace("__VISTAS__", vistas.toString());
+    }
+
+    static String generarVista(String periodoId, String id, boolean visible, String kpiPeriodo,
+                               List<Movimiento> movimientos) {
+        String oculta = visible ? "" : " hidden";
+        if (movimientos.isEmpty()) {
+            return "  <div class=\"vista\" data-periodo=\"" + escaparHtml(periodoId)
+                    + "\" data-vista=\"" + id + "\"" + oculta + ">\n"
+                    + "    <section class=\"tarjeta\"><p class=\"secundario\">Sin movimientos en el período.</p></section>\n"
+                    + "  </div>\n";
+        }
+
+        List<Movimiento> enPesos = movimientos.stream().filter(m -> !m.enDolares()).toList();
+        List<Movimiento> enDolares = movimientos.stream().filter(Movimiento::enDolares).toList();
+        List<Categoria> categorias = agrupar(enPesos);
+        BigDecimal total = categorias.stream().map(Categoria::total).reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        String seccionGrafico = "";
+        String seccionCategorias = "";
+        if (total.signum() > 0) {
+            List<Categoria> torta = paraTorta(categorias);
+            seccionGrafico = plantillaGrafico()
+                    .replace("__DONUT__", generarDonut(torta, total))
+                    .replace("__LEYENDA__", generarLeyenda(torta, total))
+                    .replace("__DATOS_OPS__", generarDatosOperaciones(torta, enPesos));
+            seccionCategorias = plantillaCategorias()
+                    .replace("__TABLA_CATEGORIAS__", generarTablaCategorias(categorias, total));
+        }
+
+        return plantillaVista()
+                .replace("__PERIODO_ID__", escaparHtml(periodoId))
+                .replace("__ID__", id)
+                .replace("__OCULTA__", oculta)
                 .replace("__TOTAL__", formatoMonto(total))
                 .replace("__OPERACIONES__", String.valueOf(movimientos.size()))
-                .replace("__COLORES__", variablesColor)
-                .replace("__DONUT__", svg)
-                .replace("__LEYENDA__", leyenda)
-                .replace("__TABLA_CATEGORIAS__", tablaCategorias)
-                .replace("__TABLA_MOVIMIENTOS__", tablaMovimientos)
-                .replace("__SECCION_USD__", seccionUsd);
+                .replace("__KPI_PERIODO__", kpiPeriodo)
+                .replace("__SECCION_GRAFICO__", seccionGrafico)
+                .replace("__SECCION_CATEGORIAS__", seccionCategorias)
+                .replace("__SECCION_USD__", generarSeccionUsd(enDolares))
+                .replace("__TABLA_MOVIMIENTOS__", generarTablaMovimientos(movimientos));
+    }
+
+    static String generarKpiPeriodo(String periodoResumen) {
+        if (periodoResumen == null) return "";
+        return "<div class=\"kpi\"><div class=\"valor fecha\">" + escaparHtml(periodoResumen)
+                + "</div><div class=\"rotulo\">Período del resumen</div></div>";
     }
 
     static String generarVariablesColor() {
@@ -375,7 +552,7 @@ public class Main {
      * junta los movimientos de todas las categorías colapsadas.
      */
     static String generarDatosOperaciones(List<Categoria> torta, List<Movimiento> movimientos) {
-        java.util.Set<String> nombresPrincipales = new java.util.HashSet<>();
+        Set<String> nombresPrincipales = new HashSet<>();
         for (Categoria c : torta) {
             if (!c.nombre().equals(OTROS)) nombresPrincipales.add(c.nombre());
         }
@@ -428,11 +605,11 @@ public class Main {
         StringBuilder sb = new StringBuilder();
         for (Categoria c : categorias) {
             sb.append(String.format(java.util.Locale.ROOT,
-                    "        <tr><td>%s</td><td class=\"num\">%d</td><td class=\"num\">$ %s</td><td class=\"num\">%.1f%%</td></tr>\n",
+                    "          <tr><td>%s</td><td class=\"num\">%d</td><td class=\"num\">$ %s</td><td class=\"num\">%.1f%%</td></tr>\n",
                     escaparHtml(c.nombre()), c.operaciones(), formatoMonto(c.total()), porcentaje(c.total(), total)));
         }
         sb.append(String.format(
-                "        <tr class=\"fila-total\"><td>Total</td><td class=\"num\"></td><td class=\"num\">$ %s</td><td class=\"num\">100%%</td></tr>\n",
+                "          <tr class=\"fila-total\"><td>Total</td><td class=\"num\"></td><td class=\"num\">$ %s</td><td class=\"num\">100%%</td></tr>\n",
                 formatoMonto(total)));
         return sb.toString();
     }
@@ -442,8 +619,8 @@ public class Main {
         for (Movimiento m : movimientos) {
             String moneda = m.enDolares() ? "USD" : "$";
             sb.append(String.format(
-                    "        <tr><td>%s</td><td>%s</td><td>%s</td><td class=\"num\">%s %s</td></tr>\n",
-                    m.fecha(), escaparHtml(m.descripcion()), escaparHtml(m.categoria()),
+                    "            <tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class=\"num\">%s %s</td></tr>\n",
+                    m.fecha(), escaparHtml(m.descripcion()), m.fuente(), escaparHtml(m.categoria()),
                     moneda, formatoMonto(m.importe())));
         }
         return sb.toString();
@@ -458,13 +635,67 @@ public class Main {
                  .append(" — USD ").append(formatoMonto(m.importe())).append("</li>\n");
         }
         return """
-                <section class="tarjeta">
-                  <h2>Consumos en dólares (fuera de la torta)</h2>
-                  <p class="secundario">Total: USD __TOTAL_USD__</p>
-                  <ul class="lista-usd">
+                    <section class="tarjeta">
+                      <h2>Consumos en dólares (fuera de la torta)</h2>
+                      <p class="secundario">Total: USD __TOTAL_USD__</p>
+                      <ul class="lista-usd">
                 __ITEMS__      </ul>
-                </section>
+                    </section>
                 """.replace("__TOTAL_USD__", formatoMonto(total)).replace("__ITEMS__", items.toString());
+    }
+
+    static String plantillaVista() {
+        return """
+  <div class="vista" data-periodo="__PERIODO_ID__" data-vista="__ID__"__OCULTA__>
+    <section class="tarjeta kpis">
+      <div class="kpi"><div class="valor">$ __TOTAL__</div><div class="rotulo">Total consumos ARS</div></div>
+      <div class="kpi"><div class="valor">__OPERACIONES__</div><div class="rotulo">Operaciones</div></div>
+      __KPI_PERIODO__
+    </section>
+__SECCION_GRAFICO__
+__SECCION_CATEGORIAS__
+__SECCION_USD__
+    <section class="tarjeta desplazable">
+      <details>
+        <summary>Todos los movimientos (__OPERACIONES__)</summary>
+        <table>
+          <thead><tr><th>Fecha</th><th>Descripción</th><th>Fuente</th><th>Categoría</th><th class="num">Importe</th></tr></thead>
+          <tbody>
+__TABLA_MOVIMIENTOS__          </tbody>
+        </table>
+      </details>
+    </section>
+  </div>
+""";
+    }
+
+    static String plantillaGrafico() {
+        return """
+    <section class="tarjeta">
+      <h2>Gastos por categoría</h2>
+      <div class="grafico">
+__DONUT__
+        <ul class="leyenda">
+__LEYENDA__        </ul>
+      </div>
+    </section>
+    <script type="application/json" class="datos-operaciones">
+__DATOS_OPS__
+    </script>
+""";
+    }
+
+    static String plantillaCategorias() {
+        return """
+    <section class="tarjeta desplazable">
+      <h2>Detalle por categoría</h2>
+      <table>
+        <thead><tr><th>Categoría</th><th class="num">Operaciones</th><th class="num">Total</th><th class="num">%</th></tr></thead>
+        <tbody>
+__TABLA_CATEGORIAS__        </tbody>
+      </table>
+    </section>
+""";
     }
 
     static String plantilla() {
@@ -474,7 +705,7 @@ public class Main {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gastos por categoría — __PERIODO__</title>
+<title>Gastos por categoría</title>
 <style>
   :root {
     --superficie: #fcfcfb;
@@ -512,9 +743,24 @@ __COLORES__  }
     background: var(--superficie); border: 1px solid var(--borde);
     border-radius: 12px; padding: 20px;
   }
+  .selectores { display: grid; gap: 10px; justify-items: start; }
+  .selector {
+    display: inline-flex; flex-wrap: wrap;
+    background: var(--superficie); border: 1px solid var(--borde);
+    border-radius: 10px; overflow: hidden;
+  }
+  .selector button {
+    border: 0; background: none; color: var(--tinta-secundaria);
+    font: inherit; font-size: 0.9rem; padding: 8px 18px; cursor: pointer;
+  }
+  .selector button + button { border-left: 1px solid var(--borde); }
+  .selector button.activo { background: var(--tinta); color: var(--superficie); font-weight: 600; }
+  .vista { display: grid; gap: 20px; }
+  .vista[hidden] { display: none; }
   .kpis { display: flex; gap: 16px; flex-wrap: wrap; }
   .kpi { flex: 1 1 180px; }
   .kpi .valor { font-size: 2rem; font-weight: 650; }
+  .kpi .valor.fecha { font-size: 1.35rem; line-height: 2.9rem; white-space: nowrap; }
   .kpi .rotulo { color: var(--tinta-tenue); font-size: 0.8rem; text-transform: uppercase; letter-spacing: .04em; }
   .grafico { display: flex; gap: 28px; align-items: center; flex-wrap: wrap; }
   .grafico svg { width: min(380px, 100%); height: auto; flex: 0 1 380px; }
@@ -556,74 +802,69 @@ __COLORES__  }
 <main>
   <header>
     <h1>¿En qué categorías gastás más?</h1>
-    <p class="secundario">Resumen de tarjeta __PERIODO__ — consumos del período en pesos</p>
+    <p class="secundario">Consumos del período en pesos — Visa y Mercado Pago</p>
   </header>
 
-  <section class="tarjeta kpis">
-    <div class="kpi"><div class="valor">$ __TOTAL__</div><div class="rotulo">Total consumos ARS</div></div>
-    <div class="kpi"><div class="valor">__OPERACIONES__</div><div class="rotulo">Operaciones</div></div>
-  </section>
-
-  <section class="tarjeta">
-    <h2>Gastos por categoría</h2>
-    <div class="grafico">
-__DONUT__
-      <ul class="leyenda">
-__LEYENDA__      </ul>
+  <div class="selectores">
+    <div class="selector" id="selector-periodo" role="group" aria-label="Período">
+__BOTONES_PERIODO__    </div>
+    <div class="selector" id="selector-fuente" role="group" aria-label="Fuente de datos">
+      <button type="button" data-vista="visa">Visa</button>
+      <button type="button" data-vista="mpago">Mercado Pago</button>
+      <button type="button" data-vista="ambas" class="activo">Ambas</button>
     </div>
-  </section>
+  </div>
 
-  <section class="tarjeta desplazable">
-    <h2>Detalle por categoría</h2>
-    <table>
-      <thead><tr><th>Categoría</th><th class="num">Operaciones</th><th class="num">Total</th><th class="num">%</th></tr></thead>
-      <tbody>
-__TABLA_CATEGORIAS__      </tbody>
-    </table>
-  </section>
-
-__SECCION_USD__
-  <section class="tarjeta desplazable">
-    <details>
-      <summary>Todos los movimientos (__OPERACIONES__)</summary>
-      <table>
-        <thead><tr><th>Fecha</th><th>Descripción</th><th>Categoría</th><th class="num">Importe</th></tr></thead>
-        <tbody>
-__TABLA_MOVIMIENTOS__        </tbody>
-      </table>
-    </details>
-  </section>
+__VISTAS__
 </main>
 <div id="tooltip"></div>
-<script id="datos-operaciones" type="application/json">
-__DATOS_OPS__
-</script>
 <script>
   const tooltip = document.getElementById('tooltip');
-  const opsPorPorcion = JSON.parse(document.getElementById('datos-operaciones').textContent);
 
   function escaparTexto(s) {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  document.querySelectorAll('.grafico svg path').forEach(p => {
-    p.addEventListener('mousemove', e => {
-      const ops = opsPorPorcion[+p.dataset.idx] || [];
-      let html = '<strong>' + escaparTexto(p.dataset.nombre) + '</strong>' +
-        p.dataset.monto + ' · ' + p.dataset.pct + ' · ' + p.dataset.ops + ' operaciones';
-      html += '<ul>' + ops.map(o =>
-        '<li><span class="op-desc">' + escaparTexto(o.f + ' · ' + o.d) + '</span>' +
-        '<span class="op-monto">' + escaparTexto(o.m) + '</span></li>').join('') + '</ul>';
-      tooltip.innerHTML = html;
-      tooltip.style.display = 'block';
-      const r = tooltip.getBoundingClientRect();
-      let x = e.clientX + 14, y = e.clientY + 14;
-      if (x + r.width > window.innerWidth - 8) x = e.clientX - r.width - 14;
-      if (y + r.height > window.innerHeight - 8) y = Math.max(8, e.clientY - r.height - 14);
-      tooltip.style.left = x + 'px';
-      tooltip.style.top = y + 'px';
+  let periodoActivo = document.querySelector('#selector-periodo button.activo').dataset.periodo;
+  let fuenteActiva = 'ambas';
+
+  function actualizarVistas() {
+    document.querySelectorAll('.vista').forEach(v =>
+      v.hidden = v.dataset.periodo !== periodoActivo || v.dataset.vista !== fuenteActiva);
+  }
+
+  document.querySelectorAll('.selector button').forEach(b => {
+    b.addEventListener('click', () => {
+      b.closest('.selector').querySelectorAll('button').forEach(o => o.classList.toggle('activo', o === b));
+      if (b.dataset.periodo) periodoActivo = b.dataset.periodo;
+      else fuenteActiva = b.dataset.vista;
+      actualizarVistas();
     });
-    p.addEventListener('mouseleave', () => tooltip.style.display = 'none');
+  });
+
+  document.querySelectorAll('.vista').forEach(v => {
+    const datos = v.querySelector('.datos-operaciones');
+    if (!datos) return;
+    const opsPorPorcion = JSON.parse(datos.textContent);
+    v.querySelectorAll('.grafico svg path').forEach(p => {
+      p.addEventListener('mousemove', e => {
+        const ops = opsPorPorcion[+p.dataset.idx] || [];
+        let html = '<strong>' + escaparTexto(p.dataset.nombre) + '</strong>' +
+          p.dataset.monto + ' · ' + p.dataset.pct + ' · ' + p.dataset.ops + ' operaciones';
+        html += '<ul>' + ops.map(o =>
+          '<li><span class="op-desc">' + escaparTexto(o.f + ' · ' + o.d) + '</span>' +
+          '<span class="op-monto">' + escaparTexto(o.m) + '</span></li>').join('') + '</ul>';
+        tooltip.innerHTML = html;
+        tooltip.style.display = 'block';
+        const r = tooltip.getBoundingClientRect();
+        let x = e.clientX + 14, y = e.clientY + 14;
+        if (x + r.width > window.innerWidth - 8) x = e.clientX - r.width - 14;
+        if (y + r.height > window.innerHeight - 8) y = Math.max(8, e.clientY - r.height - 14);
+        tooltip.style.left = x + 'px';
+        tooltip.style.top = y + 'px';
+      });
+      p.addEventListener('mouseleave', () => tooltip.style.display = 'none');
+    });
   });
 </script>
 </body>

@@ -5,6 +5,7 @@ htmls/*
 !htmls/.gitkeep
 clave.txt
 cotizacion.log
+mpago/
 
 ### Claude Code ###
 .claude/
