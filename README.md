@@ -52,12 +52,14 @@ java -cp "out;lib\pdfbox-app-3.0.5.jar" Main [pdf-o-directorio] [directorio-sali
 └── procesar.bat    compila y ejecuta
 ```
 
-## Cotización del dólar (GitHub Pages)
+## Relación dólar oficial – UVA (GitHub Pages)
 
-Proceso aparte (`src/CotizacionDolar.java`) que consulta al Banco Nación la
-cotización del dólar billete de los últimos 90 días, genera en
-`docs/index.html` una página con el gráfico diario del valor de venta, un
-monto fijo en pesos y su equivalente en dólares a la venta del día, y la
+Proceso aparte (`src/DolarUva.java`) que consulta al Banco Nación la
+cotización de venta del dólar billete y al BCRA el valor diario de la UVA
+(API de estadísticas v4, variable 31) de los últimos 2 años, y genera en
+`docs/index.html` una página con el gráfico, rueda por rueda, de cuántas UVAs
+se cancelan con US$ 1.000 al dólar oficial (`1000 × venta / UVA`), con tooltip
+por fecha (UVAs, dólar venta y UVA del día) y el valor del último día. La
 publica commiteando `docs/` a `main` (GitHub Pages sirve ese directorio):
 
 ```bat

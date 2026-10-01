@@ -27,44 +27,45 @@ import java.util.Base64;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-/**
- * Proceso batch: consulta al Banco Nación la cotización del dólar billete de
- * los últimos 90 días y genera en docs/index.html una página (publicable como
- * GitHub Page) con la evolución diaria del valor de venta, un monto fijo en
- * pesos y su equivalente en dólares a la cotización del día de procesamiento.
- *
- * Uso: java CotizacionDolar
- */
-public class CotizacionDolar {
+public class DolarUva {
 
     record Cotizacion(LocalDate fecha, BigDecimal venta) {}
+
+    record Punto(LocalDate fecha, BigDecimal venta, BigDecimal uva, BigDecimal uvas) {}
 
     private static final String BNA_BASE = "https://www.bna.com.ar/Cotizador";
     private static final String ID_TABLA = "billetes";
     private static final String ID_MONEDA_DOLAR = "22";
-    private static final int DIAS_HISTORIA = 90;
 
-    private static final BigDecimal MONTO_ARS = new BigDecimal("113680000");
+    private static final String BCRA_UVA_BASE = "https://api.bcra.gob.ar/estadisticas/v4.0/Monetarias/31";
+    private static final Pattern BCRA_DETALLE = Pattern.compile(
+            "\"fecha\"\\s*:\\s*\"(\\d{4}-\\d{2}-\\d{2})\"\\s*,\\s*\"valor\"\\s*:\\s*([0-9.]+)");
+
+    private static final int ANIOS_HISTORIA = 2;
+    private static final BigDecimal DOLARES = new BigDecimal("1000");
 
     private static final Path SALIDA = Path.of("docs", "index.html");
 
-    // La página publicada va cifrada con AES-256-GCM; la clave se deriva con
-    // PBKDF2 de la frase guardada en ARCHIVO_CLAVE (local, ignorado por git).
     private static final Path ARCHIVO_CLAVE = Path.of("clave.txt");
     private static final int ITERACIONES_PBKDF2 = 600_000;
 
     private static final DateTimeFormatter FECHA_BNA = DateTimeFormatter.ofPattern("dd/MM/yyyy");
     private static final DateTimeFormatter FECHA_CSV = DateTimeFormatter.ofPattern("d/M/yyyy");
-    private static final DateTimeFormatter FECHA_CORTA = DateTimeFormatter.ofPattern("dd/MM");
+    private static final DateTimeFormatter FECHA_ISO = DateTimeFormatter.ISO_LOCAL_DATE;
+    private static final DateTimeFormatter MES_CORTO =
+            DateTimeFormatter.ofPattern("MMM yy", Locale.forLanguageTag("es-AR"));
 
-    // Geometría del SVG del gráfico (coordenadas del viewBox).
     private static final int SVG_ANCHO = 940, SVG_ALTO = 420;
     private static final int MARGEN_IZQ = 70, MARGEN_DER = 24, MARGEN_SUP = 18, MARGEN_INF = 40;
 
     public static void main(String[] args) throws Exception {
         LocalDate hasta = LocalDate.now();
-        LocalDate desde = hasta.minusDays(DIAS_HISTORIA);
+        LocalDate desde = hasta.minusYears(ANIOS_HISTORIA);
         HttpClient http = clienteHttp();
 
         if (!hayCotizaciones(http, desde, hasta)) {
@@ -79,17 +80,30 @@ public class CotizacionDolar {
             System.exit(1);
         }
 
-        Cotizacion ultima = cotizaciones.get(cotizaciones.size() - 1);
-        BigDecimal montoUsd = MONTO_ARS.divide(ultima.venta(), 2, RoundingMode.HALF_UP);
+        TreeMap<LocalDate, BigDecimal> uvas = descargarUva(http, desde, hasta);
+        if (uvas.isEmpty()) {
+            System.err.println("La descarga del BCRA no trajo valores de UVA.");
+            System.exit(1);
+        }
 
-        System.out.printf("Cotizaciones obtenidas: %d (del %s al %s)%n", cotizaciones.size(),
-                FECHA_BNA.format(cotizaciones.get(0).fecha()), FECHA_BNA.format(ultima.fecha()));
-        System.out.printf("Venta del día de procesamiento (%s): %s%n",
-                FECHA_BNA.format(ultima.fecha()), pesos2().format(ultima.venta()));
-        System.out.printf("Monto %s ARS = %s USD%n",
-                pesos0().format(MONTO_ARS), dolares().format(montoUsd));
+        List<Punto> puntos = combinar(cotizaciones, uvas);
+        if (puntos.isEmpty()) {
+            System.err.println("No hay fechas con cotización del BNA y valor de UVA a la vez.");
+            System.exit(1);
+        }
+        Punto ultimo = puntos.get(puntos.size() - 1);
 
-        String html = generarHtml(cotizaciones, ultima, montoUsd, hasta);
+        System.out.printf("Cotizaciones BNA: %d (del %s al %s)%n", cotizaciones.size(),
+                FECHA_BNA.format(cotizaciones.get(0).fecha()),
+                FECHA_BNA.format(cotizaciones.get(cotizaciones.size() - 1).fecha()));
+        System.out.printf("Valores UVA BCRA: %d (del %s al %s)%n", uvas.size(),
+                FECHA_BNA.format(uvas.firstKey()), FECHA_BNA.format(uvas.lastKey()));
+        System.out.printf("Último punto (%s): dólar venta %s, UVA %s, %s = %s UVAs%n",
+                FECHA_BNA.format(ultimo.fecha()), pesos2().format(ultimo.venta()),
+                pesos2().format(ultimo.uva()), dolares0().format(DOLARES),
+                unidades().format(ultimo.uvas()));
+
+        String html = generarHtml(puntos, ultimo, hasta);
         String clave = leerOCrearClave();
         Cifrado cifrado = encriptar(html, clave);
         String pagina = plantillaLoader()
@@ -102,10 +116,6 @@ public class CotizacionDolar {
         System.out.println("Página generada (cifrada con la clave de "
                 + ARCHIVO_CLAVE + "): " + SALIDA.toAbsolutePath());
     }
-
-    // ------------------------------------------------------------------
-    // Cifrado de la página
-    // ------------------------------------------------------------------
 
     record Cifrado(String salt, String iv, String datos) {}
 
@@ -143,10 +153,6 @@ public class CotizacionDolar {
                 b64.encodeToString(datos));
     }
 
-    // ------------------------------------------------------------------
-    // BNA
-    // ------------------------------------------------------------------
-
     private static boolean hayCotizaciones(HttpClient http, LocalDate desde, LocalDate hasta)
             throws Exception {
         return Boolean.parseBoolean(get(http, urlCotizador("HayCotizacionesEnRango", desde, hasta)).trim());
@@ -156,7 +162,6 @@ public class CotizacionDolar {
                                                           LocalDate hasta) throws Exception {
         String csv = get(http, urlCotizador("DescargarPorFecha", desde, hasta));
 
-        // Formato: Moneda;Fecha cotizacion;Compra;Venta;
         List<Cotizacion> cotizaciones = new ArrayList<>();
         for (String linea : csv.split("\r?\n")) {
             String[] campos = linea.trim().split(";");
@@ -176,6 +181,32 @@ public class CotizacionDolar {
                 + "&idMonedaDescarga=" + ID_MONEDA_DOLAR;
     }
 
+    private static TreeMap<LocalDate, BigDecimal> descargarUva(HttpClient http, LocalDate desde,
+                                                              LocalDate hasta) throws Exception {
+        String json = get(http, BCRA_UVA_BASE
+                + "?desde=" + FECHA_ISO.format(desde)
+                + "&hasta=" + FECHA_ISO.format(hasta)
+                + "&limit=1000");
+        TreeMap<LocalDate, BigDecimal> uvas = new TreeMap<>();
+        Matcher m = BCRA_DETALLE.matcher(json);
+        while (m.find()) {
+            uvas.put(LocalDate.parse(m.group(1), FECHA_ISO), new BigDecimal(m.group(2)));
+        }
+        return uvas;
+    }
+
+    private static List<Punto> combinar(List<Cotizacion> cotizaciones,
+                                        TreeMap<LocalDate, BigDecimal> uvas) {
+        List<Punto> puntos = new ArrayList<>();
+        for (Cotizacion c : cotizaciones) {
+            Map.Entry<LocalDate, BigDecimal> uva = uvas.floorEntry(c.fecha());
+            if (uva == null) continue;
+            BigDecimal cantidad = DOLARES.multiply(c.venta()).divide(uva.getValue(), 2, RoundingMode.HALF_UP);
+            puntos.add(new Punto(c.fecha(), c.venta(), uva.getValue(), cantidad));
+        }
+        return puntos;
+    }
+
     private static String get(HttpClient http, String url) throws Exception {
         HttpRequest request = HttpRequest.newBuilder(URI.create(url))
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
@@ -187,8 +218,6 @@ public class CotizacionDolar {
         return response.body();
     }
 
-    // El proxy corporativo intercepta TLS con un certificado que la JDK no
-    // conoce, así que se acepta cualquier certificado del servidor.
     private static HttpClient clienteHttp() throws Exception {
         TrustManager[] confiarTodo = {new X509TrustManager() {
             public void checkClientTrusted(X509Certificate[] chain, String authType) {}
@@ -201,83 +230,69 @@ public class CotizacionDolar {
                 .followRedirects(HttpClient.Redirect.NORMAL).build();
     }
 
-    // ------------------------------------------------------------------
-    // Página HTML
-    // ------------------------------------------------------------------
-
-    private static String generarHtml(List<Cotizacion> cotizaciones, Cotizacion ultima,
-                                      BigDecimal montoUsd, LocalDate procesado) {
-        double min = cotizaciones.stream().mapToDouble(c -> c.venta().doubleValue()).min().orElse(0);
-        double max = cotizaciones.stream().mapToDouble(c -> c.venta().doubleValue()).max().orElse(1);
+    private static String generarHtml(List<Punto> puntos, Punto ultimo, LocalDate procesado) {
+        double min = puntos.stream().mapToDouble(p -> p.uvas().doubleValue()).min().orElse(0);
+        double max = puntos.stream().mapToDouble(p -> p.uvas().doubleValue()).max().orElse(1);
         double paso = pasoLindo((max - min) / 5);
         double yMin = Math.floor(min / paso) * paso - paso / 2;
         double yMax = Math.ceil(max / paso) * paso + paso / 2;
 
-        long diaInicial = cotizaciones.get(0).fecha().toEpochDay();
-        long diaFinal = ultima.fecha().toEpochDay();
+        long diaInicial = puntos.get(0).fecha().toEpochDay();
+        long diaFinal = ultimo.fecha().toEpochDay();
         int plotAncho = SVG_ANCHO - MARGEN_IZQ - MARGEN_DER;
         int plotAlto = SVG_ALTO - MARGEN_SUP - MARGEN_INF;
 
-        // Grilla horizontal recesiva + rótulos del eje Y. Las coordenadas SVG
-        // se formatean con Locale.ROOT: el punto decimal es parte de la sintaxis.
         StringBuilder grilla = new StringBuilder();
         for (double v = Math.ceil(yMin / paso) * paso; v <= yMax + 0.001; v += paso) {
             double y = MARGEN_SUP + plotAlto - (v - yMin) / (yMax - yMin) * plotAlto;
             grilla.append(svg("      <line class=\"grilla\" x1=\"%d\" y1=\"%.1f\" x2=\"%d\" y2=\"%.1f\"/>%n",
                     MARGEN_IZQ, y, MARGEN_IZQ + plotAncho, y));
             grilla.append(svg("      <text class=\"eje\" x=\"%d\" y=\"%.1f\" text-anchor=\"end\">%s</text>%n",
-                    MARGEN_IZQ - 10, y + 4, pesos0().format(v)));
+                    MARGEN_IZQ - 10, y + 4, unidades0().format(v)));
         }
 
-        // Marcas del eje X (~6 fechas equiespaciadas).
-        int n = cotizaciones.size();
-        int cadaCuantos = Math.max(1, (int) Math.ceil(n / 6.0));
         StringBuilder ejeX = new StringBuilder();
-        for (int i = 0; i < n; i += cadaCuantos) {
-            Cotizacion c = cotizaciones.get(i);
-            double x = xDe(c.fecha().toEpochDay(), diaInicial, diaFinal, plotAncho);
+        LocalDate marca = puntos.get(0).fecha().withDayOfMonth(1).plusMonths(1);
+        while (!marca.isAfter(ultimo.fecha())) {
+            double x = xDe(marca.toEpochDay(), diaInicial, diaFinal, plotAncho);
             ejeX.append(svg("      <text class=\"eje\" x=\"%.1f\" y=\"%d\" text-anchor=\"middle\">%s</text>%n",
-                    x, MARGEN_SUP + plotAlto + 26, FECHA_CORTA.format(c.fecha())));
+                    x, MARGEN_SUP + plotAlto + 26, MES_CORTO.format(marca)));
+            marca = marca.plusMonths(3);
         }
 
-        // Línea de la serie y datos precalculados para el tooltip.
         StringBuilder puntosLinea = new StringBuilder();
         StringBuilder datosJs = new StringBuilder();
-        for (int i = 0; i < n; i++) {
-            Cotizacion c = cotizaciones.get(i);
-            double x = xDe(c.fecha().toEpochDay(), diaInicial, diaFinal, plotAncho);
-            double y = MARGEN_SUP + plotAlto - (c.venta().doubleValue() - yMin) / (yMax - yMin) * plotAlto;
+        for (int i = 0; i < puntos.size(); i++) {
+            Punto p = puntos.get(i);
+            double x = xDe(p.fecha().toEpochDay(), diaInicial, diaFinal, plotAncho);
+            double y = yDe(p.uvas().doubleValue(), yMin, yMax, plotAlto);
             puntosLinea.append(i == 0 ? "M" : " L").append(svg("%.1f %.1f", x, y));
             if (i > 0) datosJs.append(",");
-            BigDecimal usdDia = MONTO_ARS.divide(c.venta(), 2, RoundingMode.HALF_UP);
-            datosJs.append(svg("{x:%.1f,y:%.1f,f:\"%s\",v:\"%s\",u:\"%s\"}",
-                    x, y, FECHA_BNA.format(c.fecha()), pesos2().format(c.venta()),
-                    dolares().format(usdDia)));
+            datosJs.append(svg("{x:%.1f,y:%.1f,f:\"%s\",q:\"%s\",d:\"%s\",u:\"%s\"}",
+                    x, y, FECHA_BNA.format(p.fecha()), unidades().format(p.uvas()),
+                    pesos2().format(p.venta()), pesos2().format(p.uva())));
         }
 
         double ux = xDe(diaFinal, diaInicial, diaFinal, plotAncho);
-        double uy = MARGEN_SUP + plotAlto
-                - (ultima.venta().doubleValue() - yMin) / (yMax - yMin) * plotAlto;
+        double uy = yDe(ultimo.uvas().doubleValue(), yMin, yMax, plotAlto);
 
         return plantilla()
-                .replace("__RANGO__", FECHA_BNA.format(cotizaciones.get(0).fecha())
-                        + " – " + FECHA_BNA.format(ultima.fecha()))
+                .replace("__RANGO__", FECHA_BNA.format(puntos.get(0).fecha())
+                        + " – " + FECHA_BNA.format(ultimo.fecha()))
                 .replace("__PROCESADO__", FECHA_BNA.format(procesado))
                 .replace("__GRILLA__", grilla.toString())
                 .replace("__EJE_X__", ejeX.toString())
                 .replace("__LINEA__", puntosLinea.toString())
                 .replace("__ULTIMO_X__", svg("%.1f", ux))
                 .replace("__ULTIMO_Y__", svg("%.1f", uy))
-                .replace("__ETIQUETA_ULTIMO__", pesos2().format(ultima.venta()))
-                .replace("__FECHA_ULTIMA__", FECHA_BNA.format(ultima.fecha()))
-                .replace("__VENTA_ULTIMA__", pesos2().format(ultima.venta()))
-                .replace("__MONTO_ARS__", pesos0().format(MONTO_ARS))
-                .replace("__MONTO_USD__", dolares().format(montoUsd))
+                .replace("__UVAS_ULTIMO__", unidades().format(ultimo.uvas()))
+                .replace("__FECHA_ULTIMA__", FECHA_BNA.format(ultimo.fecha()))
+                .replace("__VENTA_ULTIMA__", pesos2().format(ultimo.venta()))
+                .replace("__UVA_ULTIMA__", pesos2().format(ultimo.uva()))
+                .replace("__DOLARES__", dolares0().format(DOLARES))
                 .replace("__DATOS__", datosJs.toString());
     }
 
-    // Formatea coordenadas SVG/JS siempre con punto decimal, ignorando el
-    // locale del sistema (es-AR usa coma y rompería la sintaxis).
     private static String svg(String patron, Object... args) {
         return String.format(Locale.ROOT, patron, args);
     }
@@ -286,7 +301,10 @@ public class CotizacionDolar {
         return MARGEN_IZQ + (dia - diaInicial) / (double) (diaFinal - diaInicial) * plotAncho;
     }
 
-    // Redondea un paso de eje a 1, 2 o 5 por la potencia de diez que corresponda.
+    private static double yDe(double valor, double yMin, double yMax, int plotAlto) {
+        return MARGEN_SUP + plotAlto - (valor - yMin) / (yMax - yMin) * plotAlto;
+    }
+
     private static double pasoLindo(double crudo) {
         if (crudo <= 0) return 1;
         double potencia = Math.pow(10, Math.floor(Math.log10(crudo)));
@@ -295,11 +313,13 @@ public class CotizacionDolar {
         return lindo * potencia;
     }
 
-    private static DecimalFormat pesos0() { return formato("$ #,##0"); }
-
     private static DecimalFormat pesos2() { return formato("$ #,##0.00"); }
 
-    private static DecimalFormat dolares() { return formato("US$ #,##0.00"); }
+    private static DecimalFormat dolares0() { return formato("US$ #,##0"); }
+
+    private static DecimalFormat unidades() { return formato("#,##0.00"); }
+
+    private static DecimalFormat unidades0() { return formato("#,##0"); }
 
     private static DecimalFormat formato(String patron) {
         DecimalFormatSymbols simbolos = new DecimalFormatSymbols(Locale.ROOT);
@@ -308,8 +328,6 @@ public class CotizacionDolar {
         return new DecimalFormat(patron, simbolos);
     }
 
-    // Página publicada: solo contiene el reporte cifrado y el formulario de
-    // clave; el descifrado (PBKDF2 + AES-GCM) corre en el navegador.
     static String plantillaLoader() {
         return """
 <!DOCTYPE html>
@@ -317,7 +335,7 @@ public class CotizacionDolar {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Dólar BNA — acceso</title>
+<title>Dólar oficial – UVA — acceso</title>
 <style>
   :root {
     --superficie: #fcfcfb;
@@ -369,7 +387,7 @@ public class CotizacionDolar {
 <body>
 <form id="form">
   <h1>Página protegida</h1>
-  <p>Ingresá la clave para ver la cotización del dólar.</p>
+  <p>Ingresá la clave para ver la relación dólar oficial – UVA.</p>
   <div class="fila">
     <input type="password" id="clave" placeholder="Clave" autofocus autocomplete="current-password">
     <button>Ver</button>
@@ -406,8 +424,6 @@ public class CotizacionDolar {
     ev.preventDefault();
     intentar(document.getElementById('clave').value, true);
   });
-  // Acceso directo: la clave puede ir como query param (?clave=...) o en el
-  // fragmento (#clave); el fragmento no se envía al servidor, el query sí.
   const claveUrl = new URLSearchParams(location.search).get('clave')
       || (location.hash.length > 1 ? decodeURIComponent(location.hash.slice(1)) : null);
   if (claveUrl) intentar(claveUrl, false);
@@ -424,7 +440,7 @@ public class CotizacionDolar {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Dólar BNA — últimos 90 días</title>
+<title>Dólar oficial – UVA — últimos 2 años</title>
 <style>
   :root {
     --superficie: #fcfcfb;
@@ -465,21 +481,21 @@ public class CotizacionDolar {
   .tarjeta svg { width: 100%; height: auto; display: block; }
   .grilla { stroke: var(--grilla); stroke-width: 1; }
   .eje { font-size: 13px; fill: var(--tinta-secundaria); }
-  .serie { fill: none; stroke: var(--serie-1); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
+  .serie { fill: none; stroke: var(--serie-1); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
   .punto-final { fill: var(--serie-1); stroke: var(--superficie); stroke-width: 2; }
   .etiqueta-final { font-size: 14px; font-weight: 700; fill: var(--tinta); }
   .cruz { stroke: var(--tinta-tenue); stroke-width: 1; stroke-dasharray: 3 3; }
   .punto-hover { fill: var(--serie-1); stroke: var(--superficie); stroke-width: 2; }
-  .kpi + .kpi { margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--grilla); }
   .kpi .valor { font-size: 2rem; font-weight: 650; font-variant-numeric: tabular-nums; }
   .kpi .rotulo { color: var(--tinta-tenue); font-size: 0.8rem; text-transform: uppercase; letter-spacing: .04em; }
+  .kpi .detalle { color: var(--tinta-secundaria); font-size: 0.9rem; margin-top: 8px; font-variant-numeric: tabular-nums; }
   #tooltip {
     position: fixed; pointer-events: none; display: none; z-index: 10;
     background: var(--tinta); color: var(--superficie);
     padding: 8px 11px; border-radius: 8px; font-size: 0.8rem;
   }
   #tooltip strong { display: block; font-variant-numeric: tabular-nums; }
-  #tooltip .usd {
+  #tooltip .detalle {
     display: block; margin-top: 4px; padding-top: 4px; font-size: 0.72rem; opacity: .88;
     border-top: 1px solid color-mix(in srgb, var(--superficie) 25%, transparent);
     font-variant-numeric: tabular-nums;
@@ -489,17 +505,17 @@ public class CotizacionDolar {
 <body>
 <main>
   <header>
-    <h1>Dólar U.S.A billete — venta (BNA)</h1>
-    <p class="secundario">Últimos 90 días: __RANGO__ · Fuente: Banco de la Nación Argentina · Procesado el __PROCESADO__</p>
+    <h1>Dólar oficial – UVA: UVAs por __DOLARES__</h1>
+    <p class="secundario">Últimos 2 años: __RANGO__ · Fuentes: Banco de la Nación Argentina (dólar billete, venta) y BCRA (UVA) · Procesado el __PROCESADO__</p>
   </header>
 
   <section class="tarjeta">
-    <h2>Evolución diaria del valor de venta</h2>
+    <h2>UVAs que cancelan __DOLARES__ al dólar oficial, por rueda</h2>
     <svg id="grafico" viewBox="0 0 940 420" role="img"
-         aria-label="Evolución diaria de la cotización de venta del dólar billete del BNA en los últimos 90 días">
+         aria-label="Evolución diaria de la cantidad de UVAs equivalentes a __DOLARES__ al dólar billete venta del BNA en los últimos 2 años">
 __GRILLA____EJE_X__      <path class="serie" d="__LINEA__"/>
       <circle class="punto-final" cx="__ULTIMO_X__" cy="__ULTIMO_Y__" r="4.5"/>
-      <text class="etiqueta-final" x="__ULTIMO_X__" y="__ULTIMO_Y__" dx="-8" dy="-12" text-anchor="end">__ETIQUETA_ULTIMO__</text>
+      <text class="etiqueta-final" x="__ULTIMO_X__" y="__ULTIMO_Y__" dx="-8" dy="-12" text-anchor="end">__UVAS_ULTIMO__</text>
       <g id="hover" style="display:none">
         <line class="cruz" id="cruz" y1="18" y2="380"/>
         <circle class="punto-hover" id="punto-hover" r="4.5"/>
@@ -509,12 +525,9 @@ __GRILLA____EJE_X__      <path class="serie" d="__LINEA__"/>
 
   <section class="tarjeta">
     <div class="kpi">
-      <div class="valor">__MONTO_ARS__ ARS</div>
-      <div class="rotulo">Monto en pesos</div>
-    </div>
-    <div class="kpi">
-      <div class="valor">__MONTO_USD__</div>
-      <div class="rotulo">Equivalente en dólares — venta del __FECHA_ULTIMA__: __VENTA_ULTIMA__</div>
+      <div class="valor">__UVAS_ULTIMO__ UVAs</div>
+      <div class="rotulo">Equivalente de __DOLARES__ al __FECHA_ULTIMA__</div>
+      <div class="detalle">Dólar BNA venta __VENTA_ULTIMA__ · UVA __UVA_ULTIMA__</div>
     </div>
   </section>
 </main>
@@ -541,8 +554,8 @@ __GRILLA____EJE_X__      <path class="serie" d="__LINEA__"/>
     puntoHover.setAttribute('cx', cercano.x);
     puntoHover.setAttribute('cy', cercano.y);
     hover.style.display = '';
-    tooltip.innerHTML = cercano.f + '<strong>' + cercano.v + '</strong>'
-        + '<span class="usd">__MONTO_ARS__ = ' + cercano.u + '</span>';
+    tooltip.innerHTML = cercano.f + '<strong>' + cercano.q + ' UVAs</strong>'
+        + '<span class="detalle">Dólar venta ' + cercano.d + ' · UVA ' + cercano.u + '</span>';
     tooltip.style.display = 'block';
     tooltip.style.left = Math.min(ev.clientX + 14, window.innerWidth - tooltip.offsetWidth - 8) + 'px';
     tooltip.style.top = (ev.clientY - 40) + 'px';
