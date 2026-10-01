@@ -7,6 +7,7 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 import java.math.BigDecimal;
+import java.math.MathContext;
 import java.math.RoundingMode;
 import java.net.URI;
 import java.net.URLEncoder;
@@ -23,6 +24,7 @@ import java.text.DecimalFormatSymbols;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
 import java.util.List;
@@ -38,6 +40,10 @@ public class DolarUva {
 
     record Punto(LocalDate fecha, BigDecimal venta, BigDecimal uva, BigDecimal uvas) {}
 
+    record Banda(double promedio, double p20, double p80, int percentilHoy) {}
+
+    record Prestamo(int cuotasPagadas, BigDecimal saldoUvas, BigDecimal saldoUsd, BigDecimal cuotaUsd) {}
+
     private static final String BNA_BASE = "https://www.bna.com.ar/Cotizador";
     private static final String ID_TABLA = "billetes";
     private static final String ID_MONEDA_DOLAR = "22";
@@ -46,8 +52,18 @@ public class DolarUva {
     private static final Pattern BCRA_DETALLE = Pattern.compile(
             "\"fecha\"\\s*:\\s*\"(\\d{4}-\\d{2}-\\d{2})\"\\s*,\\s*\"valor\"\\s*:\\s*([0-9.]+)");
 
-    private static final int ANIOS_HISTORIA = 2;
+    private static final int ANIOS_HISTORIA = 5;
+    private static final int MESES_PROYECCION = 12;
+    private static final int BCRA_PAGINA = 1000;
     private static final BigDecimal DOLARES = new BigDecimal("1000");
+
+    private static final BigDecimal PRESTAMO_TNA = new BigDecimal("0.075");
+    private static final BigDecimal PRESTAMO_TEA = new BigDecimal("0.07763");
+    private static final BigDecimal PRESTAMO_UVAS = new BigDecimal("53279.09");
+    private static final BigDecimal PRESTAMO_CUOTA_UVAS = new BigDecimal("372.52");
+    private static final int PRESTAMO_PLAZO_MESES = 360;
+    private static final LocalDate PRESTAMO_PRIMER_VENCIMIENTO = LocalDate.of(2026, 11, 10);
+    private static final BigDecimal RENDIMIENTO_DOLARES_ANUAL = BigDecimal.ZERO;
 
     private static final Path SALIDA = Path.of("docs", "index.html");
 
@@ -92,6 +108,12 @@ public class DolarUva {
             System.exit(1);
         }
         Punto ultimo = puntos.get(puntos.size() - 1);
+        Banda banda = banda(puntos, ultimo);
+        Punto haceUnAnio = puntoAnterior(puntos, ultimo.fecha().minusYears(1));
+        BigDecimal variacionInteranual = haceUnAnio == null ? null
+                : ultimo.uvas().divide(haceUnAnio.uvas(), MathContext.DECIMAL64).subtract(BigDecimal.ONE);
+        BigDecimal breakEven = ultimo.uvas().multiply(factorBreakEven()).setScale(2, RoundingMode.HALF_UP);
+        Prestamo prestamo = prestamo(ultimo);
 
         System.out.printf("Cotizaciones BNA: %d (del %s al %s)%n", cotizaciones.size(),
                 FECHA_BNA.format(cotizaciones.get(0).fecha()),
@@ -102,8 +124,18 @@ public class DolarUva {
                 FECHA_BNA.format(ultimo.fecha()), pesos2().format(ultimo.venta()),
                 pesos2().format(ultimo.uva()), dolares0().format(DOLARES),
                 unidades().format(ultimo.uvas()));
+        System.out.printf("Banda %d años: promedio %s, p20 %s, p80 %s, hoy en percentil %d%n",
+                ANIOS_HISTORIA, unidades().format(banda.promedio()), unidades().format(banda.p20()),
+                unidades().format(banda.p80()), banda.percentilHoy());
+        System.out.printf("Variación interanual: %s · break-even a %d meses: %s UVAs%n",
+                variacionInteranual == null ? "s/d" : porcentaje().format(variacionInteranual),
+                MESES_PROYECCION, unidades().format(breakEven));
+        System.out.printf("Préstamo: %d cuotas pagas, saldo %s UVAs = %s, cuota = %s%n",
+                prestamo.cuotasPagadas(), unidades().format(prestamo.saldoUvas()),
+                dolares2().format(prestamo.saldoUsd()), dolares2().format(prestamo.cuotaUsd()));
 
-        String html = generarHtml(puntos, ultimo, hasta);
+        String html = generarHtml(puntos, ultimo, banda, haceUnAnio, variacionInteranual, breakEven,
+                prestamo, hasta);
         String clave = leerOCrearClave();
         Cifrado cifrado = encriptar(html, clave);
         String pagina = plantillaLoader()
@@ -183,15 +215,23 @@ public class DolarUva {
 
     private static TreeMap<LocalDate, BigDecimal> descargarUva(HttpClient http, LocalDate desde,
                                                               LocalDate hasta) throws Exception {
-        String json = get(http, BCRA_UVA_BASE
-                + "?desde=" + FECHA_ISO.format(desde)
-                + "&hasta=" + FECHA_ISO.format(hasta)
-                + "&limit=1000");
         TreeMap<LocalDate, BigDecimal> uvas = new TreeMap<>();
-        Matcher m = BCRA_DETALLE.matcher(json);
-        while (m.find()) {
-            uvas.put(LocalDate.parse(m.group(1), FECHA_ISO), new BigDecimal(m.group(2)));
-        }
+        int offset = 0;
+        int leidos;
+        do {
+            String json = get(http, BCRA_UVA_BASE
+                    + "?desde=" + FECHA_ISO.format(desde)
+                    + "&hasta=" + FECHA_ISO.format(hasta)
+                    + "&limit=" + BCRA_PAGINA
+                    + "&offset=" + offset);
+            leidos = 0;
+            Matcher m = BCRA_DETALLE.matcher(json);
+            while (m.find()) {
+                uvas.put(LocalDate.parse(m.group(1), FECHA_ISO), new BigDecimal(m.group(2)));
+                leidos++;
+            }
+            offset += BCRA_PAGINA;
+        } while (leidos == BCRA_PAGINA);
         return uvas;
     }
 
@@ -205,6 +245,55 @@ public class DolarUva {
             puntos.add(new Punto(c.fecha(), c.venta(), uva.getValue(), cantidad));
         }
         return puntos;
+    }
+
+    private static Banda banda(List<Punto> puntos, Punto ultimo) {
+        double[] valores = puntos.stream().mapToDouble(p -> p.uvas().doubleValue()).sorted().toArray();
+        double promedio = Arrays.stream(valores).average().orElse(0);
+        long menoresOIguales = Arrays.stream(valores)
+                .filter(v -> v <= ultimo.uvas().doubleValue()).count();
+        int percentilHoy = (int) Math.round(100.0 * menoresOIguales / valores.length);
+        return new Banda(promedio, percentil(valores, 0.20), percentil(valores, 0.80), percentilHoy);
+    }
+
+    private static double percentil(double[] ordenados, double fraccion) {
+        double posicion = fraccion * (ordenados.length - 1);
+        int inferior = (int) Math.floor(posicion);
+        int superior = Math.min(inferior + 1, ordenados.length - 1);
+        double resto = posicion - inferior;
+        return ordenados[inferior] * (1 - resto) + ordenados[superior] * resto;
+    }
+
+    private static Punto puntoAnterior(List<Punto> puntos, LocalDate fecha) {
+        Punto anterior = null;
+        for (Punto p : puntos) {
+            if (p.fecha().isAfter(fecha)) break;
+            anterior = p;
+        }
+        return anterior;
+    }
+
+    private static BigDecimal factorBreakEven() {
+        return BigDecimal.ONE.add(PRESTAMO_TEA)
+                .divide(BigDecimal.ONE.add(RENDIMIENTO_DOLARES_ANUAL), MathContext.DECIMAL64);
+    }
+
+    private static Prestamo prestamo(Punto ultimo) {
+        BigDecimal tasaMensual = PRESTAMO_TNA.divide(BigDecimal.valueOf(12), MathContext.DECIMAL64);
+        BigDecimal saldo = PRESTAMO_UVAS;
+        int pagadas = 0;
+        LocalDate vencimiento = PRESTAMO_PRIMER_VENCIMIENTO;
+        while (!vencimiento.isAfter(ultimo.fecha()) && pagadas < PRESTAMO_PLAZO_MESES) {
+            saldo = saldo.multiply(BigDecimal.ONE.add(tasaMensual)).subtract(PRESTAMO_CUOTA_UVAS);
+            pagadas++;
+            vencimiento = vencimiento.plusMonths(1);
+        }
+        saldo = saldo.max(BigDecimal.ZERO).setScale(2, RoundingMode.HALF_UP);
+        return new Prestamo(pagadas, saldo, enDolares(saldo, ultimo), enDolares(PRESTAMO_CUOTA_UVAS, ultimo));
+    }
+
+    private static BigDecimal enDolares(BigDecimal uvas, Punto punto) {
+        return uvas.multiply(punto.uva()).divide(punto.venta(), 2, RoundingMode.HALF_UP);
     }
 
     private static String get(HttpClient http, String url) throws Exception {
@@ -230,21 +319,27 @@ public class DolarUva {
                 .followRedirects(HttpClient.Redirect.NORMAL).build();
     }
 
-    private static String generarHtml(List<Punto> puntos, Punto ultimo, LocalDate procesado) {
-        double min = puntos.stream().mapToDouble(p -> p.uvas().doubleValue()).min().orElse(0);
-        double max = puntos.stream().mapToDouble(p -> p.uvas().doubleValue()).max().orElse(1);
+    private static String generarHtml(List<Punto> puntos, Punto ultimo, Banda banda, Punto haceUnAnio,
+                                      BigDecimal variacionInteranual, BigDecimal breakEven,
+                                      Prestamo prestamo, LocalDate procesado) {
+        LocalDate finProyeccion = ultimo.fecha().plusMonths(MESES_PROYECCION);
+        double min = Math.min(puntos.stream().mapToDouble(p -> p.uvas().doubleValue()).min().orElse(0),
+                banda.p20());
+        double max = Math.max(puntos.stream().mapToDouble(p -> p.uvas().doubleValue()).max().orElse(1),
+                Math.max(banda.p80(), breakEven.doubleValue()));
         double paso = pasoLindo((max - min) / 5);
         double yMin = Math.floor(min / paso) * paso - paso / 2;
         double yMax = Math.ceil(max / paso) * paso + paso / 2;
 
         long diaInicial = puntos.get(0).fecha().toEpochDay();
-        long diaFinal = ultimo.fecha().toEpochDay();
+        long diaFinal = finProyeccion.toEpochDay();
         int plotAncho = SVG_ANCHO - MARGEN_IZQ - MARGEN_DER;
         int plotAlto = SVG_ALTO - MARGEN_SUP - MARGEN_INF;
+        int baseY = MARGEN_SUP + plotAlto;
 
         StringBuilder grilla = new StringBuilder();
         for (double v = Math.ceil(yMin / paso) * paso; v <= yMax + 0.001; v += paso) {
-            double y = MARGEN_SUP + plotAlto - (v - yMin) / (yMax - yMin) * plotAlto;
+            double y = yDe(v, yMin, yMax, plotAlto);
             grilla.append(svg("      <line class=\"grilla\" x1=\"%d\" y1=\"%.1f\" x2=\"%d\" y2=\"%.1f\"/>%n",
                     MARGEN_IZQ, y, MARGEN_IZQ + plotAncho, y));
             grilla.append(svg("      <text class=\"eje\" x=\"%d\" y=\"%.1f\" text-anchor=\"end\">%s</text>%n",
@@ -252,13 +347,44 @@ public class DolarUva {
         }
 
         StringBuilder ejeX = new StringBuilder();
-        LocalDate marca = puntos.get(0).fecha().withDayOfMonth(1).plusMonths(1);
-        while (!marca.isAfter(ultimo.fecha())) {
+        int pasoMeses = pasoMesesEjeX();
+        LocalDate marca = puntos.get(0).fecha().withDayOfMonth(1).plusMonths(pasoMeses / 2);
+        while (!marca.isAfter(finProyeccion)) {
             double x = xDe(marca.toEpochDay(), diaInicial, diaFinal, plotAncho);
             ejeX.append(svg("      <text class=\"eje\" x=\"%.1f\" y=\"%d\" text-anchor=\"middle\">%s</text>%n",
-                    x, MARGEN_SUP + plotAlto + 26, MES_CORTO.format(marca)));
-            marca = marca.plusMonths(3);
+                    x, baseY + 26, MES_CORTO.format(marca)));
+            marca = marca.plusMonths(pasoMeses);
         }
+
+        double ux = xDe(ultimo.fecha().toEpochDay(), diaInicial, diaFinal, plotAncho);
+        double uy = yDe(ultimo.uvas().doubleValue(), yMin, yMax, plotAlto);
+        double xFin = MARGEN_IZQ + plotAncho;
+        double yBreakEven = yDe(breakEven.doubleValue(), yMin, yMax, plotAlto);
+        double yP80 = yDe(banda.p80(), yMin, yMax, plotAlto);
+        double yP20 = yDe(banda.p20(), yMin, yMax, plotAlto);
+        double yPromedio = yDe(banda.promedio(), yMin, yMax, plotAlto);
+
+        StringBuilder referencias = new StringBuilder();
+        referencias.append(svg("      <rect class=\"futuro\" x=\"%.1f\" y=\"%d\" width=\"%.1f\" height=\"%d\"/>%n",
+                ux, MARGEN_SUP, xFin - ux, plotAlto));
+        referencias.append(svg("      <rect class=\"banda\" x=\"%d\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\"/>%n",
+                MARGEN_IZQ, yP80, ux - MARGEN_IZQ, yP20 - yP80));
+        referencias.append(svg("      <line class=\"media\" x1=\"%d\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\"/>%n",
+                MARGEN_IZQ, yPromedio, ux, yPromedio));
+        referencias.append(svg("      <text class=\"anotacion\" x=\"%d\" y=\"%.1f\">p80 %s</text>%n",
+                MARGEN_IZQ + 6, yP80 - 5, unidades0().format(banda.p80())));
+        referencias.append(svg("      <text class=\"anotacion\" x=\"%d\" y=\"%.1f\">promedio %s</text>%n",
+                MARGEN_IZQ + 6, yPromedio - 5, unidades0().format(banda.promedio())));
+        referencias.append(svg("      <text class=\"anotacion\" x=\"%d\" y=\"%.1f\">p20 %s</text>%n",
+                MARGEN_IZQ + 6, yP20 + 14, unidades0().format(banda.p20())));
+        referencias.append(svg("      <line class=\"hoy\" x1=\"%.1f\" y1=\"%d\" x2=\"%.1f\" y2=\"%d\"/>%n",
+                ux, MARGEN_SUP, ux, baseY));
+        referencias.append(svg("      <text class=\"anotacion\" x=\"%.1f\" y=\"%d\" text-anchor=\"middle\">hoy</text>%n",
+                ux, MARGEN_SUP - 4));
+        referencias.append(svg("      <line class=\"breakeven\" x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\"/>%n",
+                ux, uy, xFin, yBreakEven));
+        referencias.append(svg("      <text class=\"anotacion breakeven-texto\" x=\"%.1f\" y=\"%.1f\" text-anchor=\"end\">break-even %s</text>%n",
+                xFin - 4, yBreakEven - 8, unidades0().format(breakEven)));
 
         StringBuilder puntosLinea = new StringBuilder();
         StringBuilder datosJs = new StringBuilder();
@@ -273,15 +399,20 @@ public class DolarUva {
                     pesos2().format(p.venta()), pesos2().format(p.uva())));
         }
 
-        double ux = xDe(diaFinal, diaInicial, diaFinal, plotAncho);
-        double uy = yDe(ultimo.uvas().doubleValue(), yMin, yMax, plotAlto);
+        String variacionTexto = variacionInteranual == null ? "s/d" : porcentaje().format(variacionInteranual);
+        String variacionClase = variacionInteranual == null ? ""
+                : variacionInteranual.signum() < 0 ? "negativo" : "positivo";
+        String haceUnAnioTexto = haceUnAnio == null ? "sin dato"
+                : unidades().format(haceUnAnio.uvas()) + " UVAs el " + FECHA_BNA.format(haceUnAnio.fecha());
 
         return plantilla()
                 .replace("__RANGO__", FECHA_BNA.format(puntos.get(0).fecha())
                         + " – " + FECHA_BNA.format(ultimo.fecha()))
                 .replace("__PROCESADO__", FECHA_BNA.format(procesado))
+                .replace("__ANIOS__", String.valueOf(ANIOS_HISTORIA))
                 .replace("__GRILLA__", grilla.toString())
                 .replace("__EJE_X__", ejeX.toString())
+                .replace("__REFERENCIAS__", referencias.toString())
                 .replace("__LINEA__", puntosLinea.toString())
                 .replace("__ULTIMO_X__", svg("%.1f", ux))
                 .replace("__ULTIMO_Y__", svg("%.1f", uy))
@@ -290,6 +421,23 @@ public class DolarUva {
                 .replace("__VENTA_ULTIMA__", pesos2().format(ultimo.venta()))
                 .replace("__UVA_ULTIMA__", pesos2().format(ultimo.uva()))
                 .replace("__DOLARES__", dolares0().format(DOLARES))
+                .replace("__PERCENTIL__", String.valueOf(banda.percentilHoy()))
+                .replace("__PROMEDIO__", unidades().format(banda.promedio()))
+                .replace("__P20__", unidades().format(banda.p20()))
+                .replace("__P80__", unidades().format(banda.p80()))
+                .replace("__VARIACION__", variacionTexto)
+                .replace("__VARIACION_CLASE__", variacionClase)
+                .replace("__HACE_UN_ANIO__", haceUnAnioTexto)
+                .replace("__BREAK_EVEN__", unidades().format(breakEven))
+                .replace("__MESES_PROYECCION__", String.valueOf(MESES_PROYECCION))
+                .replace("__TEA__", porcentaje3().format(PRESTAMO_TEA))
+                .replace("__RENDIMIENTO_USD__", porcentaje1().format(RENDIMIENTO_DOLARES_ANUAL))
+                .replace("__SALDO_USD__", dolares2().format(prestamo.saldoUsd()))
+                .replace("__SALDO_UVAS__", unidades().format(prestamo.saldoUvas()))
+                .replace("__CUOTAS_PAGADAS__", String.valueOf(prestamo.cuotasPagadas()))
+                .replace("__PLAZO__", String.valueOf(PRESTAMO_PLAZO_MESES))
+                .replace("__CUOTA_UVAS__", unidades().format(PRESTAMO_CUOTA_UVAS))
+                .replace("__CUOTA_USD__", dolares2().format(prestamo.cuotaUsd()))
                 .replace("__DATOS__", datosJs.toString());
     }
 
@@ -305,6 +453,11 @@ public class DolarUva {
         return MARGEN_SUP + plotAlto - (valor - yMin) / (yMax - yMin) * plotAlto;
     }
 
+    private static int pasoMesesEjeX() {
+        int totalMeses = ANIOS_HISTORIA * 12 + MESES_PROYECCION;
+        return totalMeses <= 36 ? 3 : totalMeses <= 84 ? 6 : 12;
+    }
+
     private static double pasoLindo(double crudo) {
         if (crudo <= 0) return 1;
         double potencia = Math.pow(10, Math.floor(Math.log10(crudo)));
@@ -317,9 +470,17 @@ public class DolarUva {
 
     private static DecimalFormat dolares0() { return formato("US$ #,##0"); }
 
+    private static DecimalFormat dolares2() { return formato("US$ #,##0.00"); }
+
     private static DecimalFormat unidades() { return formato("#,##0.00"); }
 
     private static DecimalFormat unidades0() { return formato("#,##0"); }
+
+    private static DecimalFormat porcentaje() { return formato("+#,##0.0 %;-#,##0.0 %"); }
+
+    private static DecimalFormat porcentaje1() { return formato("#,##0.0 %"); }
+
+    private static DecimalFormat porcentaje3() { return formato("#,##0.000 %"); }
 
     private static DecimalFormat formato(String patron) {
         DecimalFormatSymbols simbolos = new DecimalFormatSymbols(Locale.ROOT);
@@ -440,7 +601,7 @@ public class DolarUva {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Dólar oficial – UVA — últimos 2 años</title>
+<title>Dólar oficial – UVA — últimos __ANIOS__ años</title>
 <style>
   :root {
     --superficie: #fcfcfb;
@@ -451,6 +612,9 @@ public class DolarUva {
     --grilla: #e1e0d9;
     --borde: rgba(11,11,11,0.10);
     --serie-1: #2a78d6;
+    --serie-2: #d0731f;
+    --positivo: #1f7a45;
+    --negativo: #b3261e;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -462,6 +626,9 @@ public class DolarUva {
       --grilla: #2c2c2a;
       --borde: rgba(255,255,255,0.10);
       --serie-1: #3987e5;
+      --serie-2: #e8914a;
+      --positivo: #5fcf8a;
+      --negativo: #ff8a80;
     }
   }
   * { box-sizing: border-box; margin: 0; }
@@ -479,16 +646,31 @@ public class DolarUva {
     border-radius: 12px; padding: 20px;
   }
   .tarjeta svg { width: 100%; height: auto; display: block; }
+  .leyenda { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 10px; font-size: 0.8rem; color: var(--tinta-secundaria); }
+  .leyenda span::before { content: ""; display: inline-block; width: 18px; height: 0; margin-right: 6px; vertical-align: middle; border-top: 2.5px solid var(--serie-1); }
+  .leyenda .l-banda::before { height: 10px; border: none; background: var(--serie-1); opacity: .14; }
+  .leyenda .l-media::before { border-top: 2px dashed var(--tinta-tenue); }
+  .leyenda .l-breakeven::before { border-top: 2px dashed var(--serie-2); }
   .grilla { stroke: var(--grilla); stroke-width: 1; }
   .eje { font-size: 13px; fill: var(--tinta-secundaria); }
+  .anotacion { font-size: 11.5px; fill: var(--tinta-tenue); paint-order: stroke; stroke: var(--superficie); stroke-width: 3px; stroke-linejoin: round; }
+  .breakeven-texto { fill: var(--serie-2); font-weight: 600; }
+  .futuro { fill: var(--tinta); opacity: .03; }
+  .banda { fill: var(--serie-1); opacity: .10; }
+  .media { stroke: var(--tinta-tenue); stroke-width: 1.5; stroke-dasharray: 6 4; }
+  .hoy { stroke: var(--tinta-tenue); stroke-width: 1; stroke-dasharray: 2 3; }
+  .breakeven { stroke: var(--serie-2); stroke-width: 2; stroke-dasharray: 6 4; stroke-linecap: round; }
   .serie { fill: none; stroke: var(--serie-1); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
   .punto-final { fill: var(--serie-1); stroke: var(--superficie); stroke-width: 2; }
   .etiqueta-final { font-size: 14px; font-weight: 700; fill: var(--tinta); }
   .cruz { stroke: var(--tinta-tenue); stroke-width: 1; stroke-dasharray: 3 3; }
   .punto-hover { fill: var(--serie-1); stroke: var(--superficie); stroke-width: 2; }
-  .kpi .valor { font-size: 2rem; font-weight: 650; font-variant-numeric: tabular-nums; }
-  .kpi .rotulo { color: var(--tinta-tenue); font-size: 0.8rem; text-transform: uppercase; letter-spacing: .04em; }
-  .kpi .detalle { color: var(--tinta-secundaria); font-size: 0.9rem; margin-top: 8px; font-variant-numeric: tabular-nums; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px; }
+  .kpi .valor { font-size: 1.9rem; font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1.15; }
+  .kpi .valor.positivo { color: var(--positivo); }
+  .kpi .valor.negativo { color: var(--negativo); }
+  .kpi .rotulo { color: var(--tinta-tenue); font-size: 0.78rem; text-transform: uppercase; letter-spacing: .04em; margin-top: 4px; }
+  .kpi .detalle { color: var(--tinta-secundaria); font-size: 0.88rem; margin-top: 10px; font-variant-numeric: tabular-nums; }
   #tooltip {
     position: fixed; pointer-events: none; display: none; z-index: 10;
     background: var(--tinta); color: var(--superficie);
@@ -506,14 +688,14 @@ public class DolarUva {
 <main>
   <header>
     <h1>Dólar oficial – UVA: UVAs por __DOLARES__</h1>
-    <p class="secundario">Últimos 2 años: __RANGO__ · Fuentes: Banco de la Nación Argentina (dólar billete, venta) y BCRA (UVA) · Procesado el __PROCESADO__</p>
+    <p class="secundario">Últimos __ANIOS__ años: __RANGO__ · Fuentes: Banco de la Nación Argentina (dólar billete, venta) y BCRA (UVA) · Procesado el __PROCESADO__</p>
   </header>
 
   <section class="tarjeta">
     <h2>UVAs que cancelan __DOLARES__ al dólar oficial, por rueda</h2>
     <svg id="grafico" viewBox="0 0 940 420" role="img"
-         aria-label="Evolución diaria de la cantidad de UVAs equivalentes a __DOLARES__ al dólar billete venta del BNA en los últimos 2 años">
-__GRILLA____EJE_X__      <path class="serie" d="__LINEA__"/>
+         aria-label="Evolución diaria de la cantidad de UVAs equivalentes a __DOLARES__ al dólar billete venta del BNA en los últimos __ANIOS__ años, con banda histórica y línea de break-even a __MESES_PROYECCION__ meses">
+__GRILLA____EJE_X____REFERENCIAS__      <path class="serie" d="__LINEA__"/>
       <circle class="punto-final" cx="__ULTIMO_X__" cy="__ULTIMO_Y__" r="4.5"/>
       <text class="etiqueta-final" x="__ULTIMO_X__" y="__ULTIMO_Y__" dx="-8" dy="-12" text-anchor="end">__UVAS_ULTIMO__</text>
       <g id="hover" style="display:none">
@@ -521,13 +703,39 @@ __GRILLA____EJE_X__      <path class="serie" d="__LINEA__"/>
         <circle class="punto-hover" id="punto-hover" r="4.5"/>
       </g>
     </svg>
+    <div class="leyenda">
+      <span>UVAs por __DOLARES__</span>
+      <span class="l-banda">Banda p20–p80 de los __ANIOS__ años</span>
+      <span class="l-media">Promedio</span>
+      <span class="l-breakeven">Break-even a __MESES_PROYECCION__ meses (TEA __TEA__ real)</span>
+    </div>
   </section>
 
-  <section class="tarjeta">
-    <div class="kpi">
+  <section class="kpis">
+    <div class="tarjeta kpi">
       <div class="valor">__UVAS_ULTIMO__ UVAs</div>
       <div class="rotulo">Equivalente de __DOLARES__ al __FECHA_ULTIMA__</div>
       <div class="detalle">Dólar BNA venta __VENTA_ULTIMA__ · UVA __UVA_ULTIMA__</div>
+    </div>
+    <div class="tarjeta kpi">
+      <div class="valor">Percentil __PERCENTIL__</div>
+      <div class="rotulo">Posición de hoy en los últimos __ANIOS__ años</div>
+      <div class="detalle">Promedio __PROMEDIO__ · banda p20–p80: __P20__ – __P80__. Arriba de la banda el dólar está caro en UVAs y conviene cancelar; abajo, conviene esperar.</div>
+    </div>
+    <div class="tarjeta kpi">
+      <div class="valor __VARIACION_CLASE__">__VARIACION__</div>
+      <div class="rotulo">Variación interanual de UVAs por __DOLARES__</div>
+      <div class="detalle">Hace un año: __HACE_UN_ANIO__. Es la devaluación del oficial menos la inflación (UVA): si es negativa, cada mes que pasa los dólares cancelan menos deuda.</div>
+    </div>
+    <div class="tarjeta kpi">
+      <div class="valor">≥ __BREAK_EVEN__ UVAs</div>
+      <div class="rotulo">Break-even a __MESES_PROYECCION__ meses para que convenga esperar</div>
+      <div class="detalle">Cancelar hoy rinde la TEA del préstamo, __TEA__ real sobre UVA. Con los dólares rindiendo __RENDIMIENTO_USD__, esperar solo gana si en un año __DOLARES__ compran al menos esa cantidad de UVAs.</div>
+    </div>
+    <div class="tarjeta kpi">
+      <div class="valor">__SALDO_USD__</div>
+      <div class="rotulo">Para cancelar el préstamo hoy al oficial</div>
+      <div class="detalle">Saldo __SALDO_UVAS__ UVAs tras __CUOTAS_PAGADAS__ de __PLAZO__ cuotas · cuota __CUOTA_UVAS__ UVAs = __CUOTA_USD__</div>
     </div>
   </section>
 </main>
@@ -541,10 +749,17 @@ __GRILLA____EJE_X__      <path class="serie" d="__LINEA__"/>
   const cruz = document.getElementById('cruz');
   const puntoHover = document.getElementById('punto-hover');
   const tooltip = document.getElementById('tooltip');
+  const ultimoX = datos[datos.length - 1].x;
+
+  function ocultar() {
+    hover.style.display = 'none';
+    tooltip.style.display = 'none';
+  }
 
   svg.addEventListener('mousemove', ev => {
     const rect = svg.getBoundingClientRect();
     const xSvg = (ev.clientX - rect.left) * 940 / rect.width;
+    if (xSvg > ultimoX + 8) { ocultar(); return; }
     let cercano = datos[0];
     for (const d of datos) {
       if (Math.abs(d.x - xSvg) < Math.abs(cercano.x - xSvg)) cercano = d;
@@ -560,10 +775,7 @@ __GRILLA____EJE_X__      <path class="serie" d="__LINEA__"/>
     tooltip.style.left = Math.min(ev.clientX + 14, window.innerWidth - tooltip.offsetWidth - 8) + 'px';
     tooltip.style.top = (ev.clientY - 40) + 'px';
   });
-  svg.addEventListener('mouseleave', () => {
-    hover.style.display = 'none';
-    tooltip.style.display = 'none';
-  });
+  svg.addEventListener('mouseleave', ocultar);
 </script>
 </body>
 </html>

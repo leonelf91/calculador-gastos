@@ -56,11 +56,27 @@ java -cp "out;lib\pdfbox-app-3.0.5.jar" Main [pdf-o-directorio] [directorio-sali
 
 Proceso aparte (`src/DolarUva.java`) que consulta al Banco Nación la
 cotización de venta del dólar billete y al BCRA el valor diario de la UVA
-(API de estadísticas v4, variable 31) de los últimos 2 años, y genera en
+(API de estadísticas v4, variable 31) de los últimos 5 años, y genera en
 `docs/index.html` una página con el gráfico, rueda por rueda, de cuántas UVAs
 se cancelan con US$ 1.000 al dólar oficial (`1000 × venta / UVA`), con tooltip
-por fecha (UVAs, dólar venta y UVA del día) y el valor del último día. La
-publica commiteando `docs/` a `main` (GitHub Pages sirve ese directorio):
+por fecha (UVAs, dólar venta y UVA del día). Sobre el gráfico se dibujan tres
+referencias para decidir si conviene precancelar un préstamo UVA con dólares:
+
+- La banda histórica: promedio y percentiles 20/80 de la serie. Por encima de
+  la banda el dólar está caro en UVAs y conviene cancelar; por debajo, esperar.
+- La variación interanual de UVAs por US$ 1.000 (devaluación del oficial menos
+  inflación medida por UVA): negativa significa que esperar sale caro.
+- La línea de break-even a 12 meses: cancelar rinde la TEA real del préstamo,
+  así que esperar solo conviene si en un año los dólares compran al menos
+  `UVAs de hoy × (1 + TEA) / (1 + rendimiento de los dólares)`.
+
+Debajo van los KPI del día (UVAs por US$ 1.000, percentil, variación, break-even)
+y un panel del préstamo: saldo en UVAs según las cuotas vencidas (sistema
+francés con TNA/12) y los dólares que lo cancelan al oficial, más la cuota en
+dólares. Los datos del préstamo (UVAs, cuota, TNA, TEA, plazo, primer
+vencimiento) y el rendimiento supuesto de los dólares son constantes al inicio
+de la clase. La publica commiteando `docs/` a `main` (GitHub Pages sirve ese
+directorio):
 
 ```bat
 cotizacion.bat
