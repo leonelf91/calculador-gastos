@@ -62,8 +62,10 @@ se cancelan con US$ 1.000 al dólar oficial (`1000 × venta / UVA`), con tooltip
 por fecha (UVAs, dólar venta y UVA del día). Sobre el gráfico se dibujan tres
 referencias para decidir si conviene precancelar un préstamo UVA con dólares:
 
-- La banda histórica: promedio y percentiles 20/80 de la serie. Por encima de
-  la banda el dólar está caro en UVAs y conviene cancelar; por debajo, esperar.
+- Las zonas históricas, definidas por el promedio y los percentiles 20/80 de la
+  serie: verde por encima del p80 (el dólar está caro en UVAs, adelantar
+  fuerte), amarilla entre p20 y p80 (adelantar de a poco) y roja por debajo del
+  p20 (esperar). El KPI del percentil dice en qué zona está hoy.
 - La variación interanual de UVAs por US$ 1.000 (devaluación del oficial menos
   inflación medida por UVA): negativa significa que esperar sale caro.
 - La línea de break-even a 12 meses: cancelar rinde la TEA real del préstamo,

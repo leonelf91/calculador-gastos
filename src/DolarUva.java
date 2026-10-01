@@ -256,6 +256,16 @@ public class DolarUva {
         return new Banda(promedio, percentil(valores, 0.20), percentil(valores, 0.80), percentilHoy);
     }
 
+    private static String zona(Punto ultimo, Banda banda) {
+        double hoy = ultimo.uvas().doubleValue();
+        return hoy > banda.p80() ? "Adelantar fuerte" : hoy < banda.p20() ? "Esperar" : "Adelantar de a poco";
+    }
+
+    private static String zonaClase(Punto ultimo, Banda banda) {
+        double hoy = ultimo.uvas().doubleValue();
+        return hoy > banda.p80() ? "positivo" : hoy < banda.p20() ? "negativo" : "advertencia";
+    }
+
     private static double percentil(double[] ordenados, double fraccion) {
         double posicion = fraccion * (ordenados.length - 1);
         int inferior = (int) Math.floor(posicion);
@@ -367,8 +377,12 @@ public class DolarUva {
         StringBuilder referencias = new StringBuilder();
         referencias.append(svg("      <rect class=\"futuro\" x=\"%.1f\" y=\"%d\" width=\"%.1f\" height=\"%d\"/>%n",
                 ux, MARGEN_SUP, xFin - ux, plotAlto));
-        referencias.append(svg("      <rect class=\"banda\" x=\"%d\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\"/>%n",
+        referencias.append(svg("      <rect class=\"zona zona-adelantar\" x=\"%d\" y=\"%d\" width=\"%.1f\" height=\"%.1f\"/>%n",
+                MARGEN_IZQ, MARGEN_SUP, ux - MARGEN_IZQ, yP80 - MARGEN_SUP));
+        referencias.append(svg("      <rect class=\"zona zona-gradual\" x=\"%d\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\"/>%n",
                 MARGEN_IZQ, yP80, ux - MARGEN_IZQ, yP20 - yP80));
+        referencias.append(svg("      <rect class=\"zona zona-esperar\" x=\"%d\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\"/>%n",
+                MARGEN_IZQ, yP20, ux - MARGEN_IZQ, baseY - yP20));
         referencias.append(svg("      <line class=\"media\" x1=\"%d\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\"/>%n",
                 MARGEN_IZQ, yPromedio, ux, yPromedio));
         referencias.append(svg("      <text class=\"anotacion\" x=\"%d\" y=\"%.1f\">p80 %s</text>%n",
@@ -427,6 +441,8 @@ public class DolarUva {
                 .replace("__P80__", unidades().format(banda.p80()))
                 .replace("__VARIACION__", variacionTexto)
                 .replace("__VARIACION_CLASE__", variacionClase)
+                .replace("__ZONA__", zona(ultimo, banda))
+                .replace("__ZONA_CLASE__", zonaClase(ultimo, banda))
                 .replace("__HACE_UN_ANIO__", haceUnAnioTexto)
                 .replace("__BREAK_EVEN__", unidades().format(breakEven))
                 .replace("__MESES_PROYECCION__", String.valueOf(MESES_PROYECCION))
@@ -614,7 +630,11 @@ public class DolarUva {
     --serie-1: #2a78d6;
     --serie-2: #d0731f;
     --positivo: #1f7a45;
+    --advertencia: #9a6700;
     --negativo: #b3261e;
+    --zona-adelantar: rgba(31,122,69,0.12);
+    --zona-gradual: rgba(214,160,0,0.14);
+    --zona-esperar: rgba(179,38,30,0.10);
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -628,7 +648,11 @@ public class DolarUva {
       --serie-1: #3987e5;
       --serie-2: #e8914a;
       --positivo: #5fcf8a;
+      --advertencia: #e3b341;
       --negativo: #ff8a80;
+      --zona-adelantar: rgba(95,207,138,0.16);
+      --zona-gradual: rgba(227,179,65,0.16);
+      --zona-esperar: rgba(255,138,128,0.14);
     }
   }
   * { box-sizing: border-box; margin: 0; }
@@ -648,7 +672,10 @@ public class DolarUva {
   .tarjeta svg { width: 100%; height: auto; display: block; }
   .leyenda { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 10px; font-size: 0.8rem; color: var(--tinta-secundaria); }
   .leyenda span::before { content: ""; display: inline-block; width: 18px; height: 0; margin-right: 6px; vertical-align: middle; border-top: 2.5px solid var(--serie-1); }
-  .leyenda .l-banda::before { height: 10px; border: none; background: var(--serie-1); opacity: .14; }
+  .leyenda .l-zona::before { height: 10px; border: none; }
+  .leyenda .l-adelantar::before { background: var(--zona-adelantar); }
+  .leyenda .l-gradual::before { background: var(--zona-gradual); }
+  .leyenda .l-esperar::before { background: var(--zona-esperar); }
   .leyenda .l-media::before { border-top: 2px dashed var(--tinta-tenue); }
   .leyenda .l-breakeven::before { border-top: 2px dashed var(--serie-2); }
   .grilla { stroke: var(--grilla); stroke-width: 1; }
@@ -656,7 +683,9 @@ public class DolarUva {
   .anotacion { font-size: 11.5px; fill: var(--tinta-tenue); paint-order: stroke; stroke: var(--superficie); stroke-width: 3px; stroke-linejoin: round; }
   .breakeven-texto { fill: var(--serie-2); font-weight: 600; }
   .futuro { fill: var(--tinta); opacity: .03; }
-  .banda { fill: var(--serie-1); opacity: .10; }
+  .zona-adelantar { fill: var(--zona-adelantar); }
+  .zona-gradual { fill: var(--zona-gradual); }
+  .zona-esperar { fill: var(--zona-esperar); }
   .media { stroke: var(--tinta-tenue); stroke-width: 1.5; stroke-dasharray: 6 4; }
   .hoy { stroke: var(--tinta-tenue); stroke-width: 1; stroke-dasharray: 2 3; }
   .breakeven { stroke: var(--serie-2); stroke-width: 2; stroke-dasharray: 6 4; stroke-linecap: round; }
@@ -668,6 +697,7 @@ public class DolarUva {
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px; }
   .kpi .valor { font-size: 1.9rem; font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1.15; }
   .kpi .valor.positivo { color: var(--positivo); }
+  .kpi .valor.advertencia { color: var(--advertencia); }
   .kpi .valor.negativo { color: var(--negativo); }
   .kpi .rotulo { color: var(--tinta-tenue); font-size: 0.78rem; text-transform: uppercase; letter-spacing: .04em; margin-top: 4px; }
   .kpi .detalle { color: var(--tinta-secundaria); font-size: 0.88rem; margin-top: 10px; font-variant-numeric: tabular-nums; }
@@ -705,7 +735,9 @@ __GRILLA____EJE_X____REFERENCIAS__      <path class="serie" d="__LINEA__"/>
     </svg>
     <div class="leyenda">
       <span>UVAs por __DOLARES__</span>
-      <span class="l-banda">Banda p20–p80 de los __ANIOS__ años</span>
+      <span class="l-zona l-adelantar">Arriba del p80: adelantar fuerte</span>
+      <span class="l-zona l-gradual">Entre p20 y p80: adelantar de a poco</span>
+      <span class="l-zona l-esperar">Abajo del p20: esperar</span>
       <span class="l-media">Promedio</span>
       <span class="l-breakeven">Break-even a __MESES_PROYECCION__ meses (TEA __TEA__ real)</span>
     </div>
@@ -718,9 +750,9 @@ __GRILLA____EJE_X____REFERENCIAS__      <path class="serie" d="__LINEA__"/>
       <div class="detalle">Dólar BNA venta __VENTA_ULTIMA__ · UVA __UVA_ULTIMA__</div>
     </div>
     <div class="tarjeta kpi">
-      <div class="valor">Percentil __PERCENTIL__</div>
-      <div class="rotulo">Posición de hoy en los últimos __ANIOS__ años</div>
-      <div class="detalle">Promedio __PROMEDIO__ · banda p20–p80: __P20__ – __P80__. Arriba de la banda el dólar está caro en UVAs y conviene cancelar; abajo, conviene esperar.</div>
+      <div class="valor __ZONA_CLASE__">__ZONA__</div>
+      <div class="rotulo">Percentil __PERCENTIL__ de los últimos __ANIOS__ años</div>
+      <div class="detalle">Promedio __PROMEDIO__ · p20 __P20__ · p80 __P80__. Arriba del p80 el dólar está caro en UVAs y conviene cancelar; abajo del p20, conviene esperar.</div>
     </div>
     <div class="tarjeta kpi">
       <div class="valor __VARIACION_CLASE__">__VARIACION__</div>
